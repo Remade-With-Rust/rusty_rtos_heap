@@ -74,9 +74,21 @@ ESP32-S3, one `alloc` + one `free` through that allocator costs:
 | > 2048 B | 933, and history-dependent | its own large span |
 
 **A 513-byte request is 43 cycles CHEAPER than a 512-byte one.** The step is
-exactly one byte wide, the totals are byte-identical within each range, and
-both boundaries are `rusty_alloc` geometry constants under `ra_small_profile`
-(`SMALL_OBJ_SIZE_MAX`, `MEDIUM_OBJ_SIZE_MAX`).
+exactly one byte wide and the totals are byte-identical within each range.
+
+**Why, resolved upstream 2026-09-10 — and it is a POINTER-WIDTH boundary, not
+a page-kind one.** `SMALL_SIZE_MAX = SMALL_WSIZE_MAX * INTPTR_SIZE`, so it is
+1,024 on a 64-bit host and **512 on every Kairos target**, which are all
+32-bit. Below it an allocation takes the `direct[]` route, which retires and
+re-carves its page on every periodic `GENERIC_COLLECT_DEFAULT` sweep (512 at
+the small profile); above it the bin route never churns. Counted on silicon:
+**21 page retires per 10,240 ops below the line, 0 above it**, with the
+generic path entered on *every* operation either side — so the slow path is
+not the difference, the churn is.
+
+**This matters to this package specifically**: every target in `KAIROS.toml`
+is 32-bit, so `heap_3` over this allocator sits on the 512 boundary on all of
+them, and a host build of the same code will not show it.
 
 ### What this package must NOT do about it
 
@@ -90,12 +102,19 @@ tuning against another crate's internals is a liability, not a design.
 
 1. **Say it.** The seam's documentation carries the band, because a caller
    choosing a buffer size is the only party that can act on it for free.
-2. **Measure `heap_1`/`heap_4`/`heap_5` against it, not against each other.**
+2. **`--cfg ra_generic_collect` is the knob, and it is a workload question.**
+   Upstream shipped `"64" | "4096" | "65536"` after this was reported: short
+   sweeps buy back a starvation the small profile had at 10,000 allocations
+   and cost page churn; long sweeps do the reverse. A bench holding one block
+   live cannot decay, so it sees only the cost — which is why this package
+   must measure its own workload before moving it, and why nothing here
+   should change the default.
+3. **Measure `heap_1`/`heap_4`/`heap_5` against it, not against each other.**
    The comparison already exists: `rusty_rtos_core/firmware/esp32s3-devkit-alloc-ab`
    runs FreeRTOS's own `heap_4.c`, compiled verbatim from the oracle, against
    `rusty_alloc` under one harness. This package's remakes inherit that
    harness rather than growing a second one.
-3. **Expect the ranking to depend on fragmentation, and gate on that.** In the
+4. **Expect the ranking to depend on fragmentation, and gate on that.** In the
    same measurement `heap_4` looks 1.27× faster than `rusty_alloc` at 256–512
    on a *pristine* heap and is **12.5× slower** against 128 same-size holes,
    degrading ~27 cycles per free-list entry walked. A heap benchmark with one
