@@ -108,26 +108,58 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
 
     // ---- the header, read and written where the C keeps it -------------
 
-    fn read_word(&self, offset: u64, word: usize) -> u64 {
+    /// Both header words in ONE bounds-checked read.
+    ///
+    /// The free-list walk asks every block for its size and then its next
+    /// pointer, which as two separate accessors is two `try_from`s, four
+    /// saturating adds, two range checks and two `copy_from_slice`s for
+    /// one 16-byte header that is contiguous in memory. Reading the header
+    /// once per visit is the same move the kernel's list work made — "each
+    /// node is read once per call" — and for the same reason: the work
+    /// removed is not the load, it is everything wrapped around the load.
+    ///
+    /// `get` rather than indexing, and a fixed-size destination, so the
+    /// compiler sees one length it can check instead of two it cannot.
+    fn header_of(&self, offset: u64) -> (u64, u64) {
         let base = usize::try_from(offset).unwrap_or(usize::MAX);
-        let at = base.saturating_add(word.saturating_mul(size_of::<u64>()));
-        let end = at.saturating_add(size_of::<u64>());
-        if end > N {
-            return 0;
-        }
-        let mut bytes = [0u8; size_of::<u64>()];
-        bytes.copy_from_slice(&self.store[at..end]);
-        u64::from_ne_bytes(bytes)
+        let Some(bytes) = self
+            .store
+            .get(base..)
+            .and_then(|rest| rest.first_chunk::<{ 2 * size_of::<u64>() }>())
+        else {
+            return (0, 0);
+        };
+        let Some(next) = bytes.first_chunk::<{ size_of::<u64>() }>() else {
+            return (0, 0);
+        };
+        let Some(size) = bytes.last_chunk::<{ size_of::<u64>() }>() else {
+            return (0, 0);
+        };
+        (u64::from_ne_bytes(*next), u64::from_ne_bytes(*size))
+    }
+
+    fn read_word(&self, offset: u64, word: usize) -> u64 {
+        let (next, size) = self.header_of(offset);
+        if word == 0 { next } else { size }
     }
 
     fn write_word(&mut self, offset: u64, word: usize, value: u64) {
         let base = usize::try_from(offset).unwrap_or(usize::MAX);
-        let at = base.saturating_add(word.saturating_mul(size_of::<u64>()));
-        let end = at.saturating_add(size_of::<u64>());
-        if end > N {
+        let Some(header) = self
+            .store
+            .get_mut(base..)
+            .and_then(|rest| rest.first_chunk_mut::<{ 2 * size_of::<u64>() }>())
+        else {
             return;
+        };
+        let bytes = value.to_ne_bytes();
+        if word == 0 {
+            if let Some(slot) = header.first_chunk_mut::<{ size_of::<u64>() }>() {
+                *slot = bytes;
+            }
+        } else if let Some(slot) = header.last_chunk_mut::<{ size_of::<u64>() }>() {
+            *slot = bytes;
         }
-        self.store[at..end].copy_from_slice(&value.to_ne_bytes());
     }
 
     /// `pxBlock->pxNextFreeBlock`.
@@ -242,9 +274,15 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         // Walk the address-ordered free list for the first block that fits.
         let mut previous: Option<u64> = None;
         let mut block = self.start_next;
-        while self.size_of(block) < size as u64 && self.next_of(block) != NONE {
+        loop {
+            // One read serves both tests. The C reads the same two fields
+            // out of one cache line; so does this now.
+            let (next, raw) = self.header_of(block);
+            if (raw & !ALLOCATED_BIT) >= size as u64 || next == NONE {
+                break;
+            }
             previous = Some(block);
-            block = self.next_of(block);
+            block = next;
         }
         // Reaching `pxEnd` means nothing was large enough.
         if block == self.end {
@@ -275,6 +313,18 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
             self.set_next_from(previous, new_block);
         }
 
+        // REFUTED, and kept as written for that reason. Folding these four
+        // reads of `chosen` into the one `header_of` above — carrying the
+        // size in a local and writing `taken | ALLOCATED_BIT` once instead
+        // of read-modify-write — MEASURED WORSE: 2,730,871 -> 2,776,099 Ir,
+        // +1.7%, on the same 20,000 operations with an identical checksum.
+        // The same move won 32.7% in the free-list walk and 13.2% in the
+        // insert, and loses here, which is the law this project keeps
+        // relearning: removing a redundant read wins only when the read
+        // costs more than the check that avoids it. In a walk the read is
+        // per node and the branch is not; here the reads are once per call
+        // and folding them introduced a merge the unconditional stores did
+        // not need.
         let taken = self.size_of(chosen);
         self.free_bytes = self.free_bytes.saturating_sub(taken as usize);
         if self.free_bytes < self.minimum_ever_free {
@@ -311,41 +361,53 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
 
     /// `prvInsertBlockIntoFreeList`: address-ordered insert that coalesces
     /// with the block before and the block after.
+    /// Every node is read ONCE.
+    ///
+    /// Written the obvious way this walks the list asking each node for
+    /// its next pointer, then asks the SAME node again to advance — and
+    /// then asks the predecessor and the successor for their sizes two and
+    /// three more times while coalescing. Each of those is a bounds check
+    /// and a load of a header that was already in hand. Carrying the
+    /// header in a local instead is the same move as the walk in `alloc`,
+    /// and the reason is the same: what it removes is not the load, it is
+    /// everything wrapped around the load.
     fn insert_into_free_list(&mut self, block: u64) {
         let mut insert = block;
+        let mut insert_size = self.size_of(insert);
 
         // Walk to the position, which is the address order the whole
-        // design rests on.
+        // design rests on. `next` is carried rather than re-read.
         let mut iterator: Option<u64> = None;
-        while self.next_from(iterator) < insert {
-            iterator = Some(self.next_from(iterator));
+        let mut next = self.start_next;
+        while next < insert {
+            iterator = Some(next);
+            next = self.next_of(next);
         }
 
         // Coalesce with the block BEFORE, if it ends exactly here.
         // `xStart` can never satisfy this: it is not in the arena, which
         // is why `iterator` is an `Option` rather than an offset.
         if let Some(previous) = iterator {
-            if previous.saturating_add(self.size_of(previous)) == insert {
-                self.set_raw_size(
-                    previous,
-                    self.size_of(previous).saturating_add(self.size_of(insert)),
-                );
+            let previous_size = self.size_of(previous);
+            if previous.saturating_add(previous_size) == insert {
+                insert_size = previous_size.saturating_add(insert_size);
+                self.set_raw_size(previous, insert_size);
                 insert = previous;
             }
         }
 
         // Coalesce with the block AFTER, unless that block is `pxEnd`,
         // which is a marker and must not be absorbed.
-        let following = self.next_from(iterator);
-        if insert.saturating_add(self.size_of(insert)) == following {
+        let following = next;
+        if insert.saturating_add(insert_size) == following {
             if following == self.end {
                 self.set_next(insert, self.end);
             } else {
+                let (after, following_raw) = self.header_of(following);
                 self.set_raw_size(
                     insert,
-                    self.size_of(insert).saturating_add(self.size_of(following)),
+                    insert_size.saturating_add(following_raw & !ALLOCATED_BIT),
                 );
-                let after = self.next_of(following);
                 self.set_next(insert, after);
             }
         } else {

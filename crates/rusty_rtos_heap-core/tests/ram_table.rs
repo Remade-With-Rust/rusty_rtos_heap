@@ -67,9 +67,24 @@ fn the_ram_table_decomposes_exactly() {
     // 32-bit is every Kairos target; 64-bit is the oracle's host, and the
     // geometry the differential runs against.
     let rows = [
-        row!("32-bit (thumbv7em, thumbv8m, riscv32imac/imafc)", 1024, 8, 8),
-        row!("32-bit (thumbv7em, thumbv8m, riscv32imac/imafc)", 4096, 8, 8),
-        row!("32-bit (thumbv7em, thumbv8m, riscv32imac/imafc)", 8192, 8, 8),
+        row!(
+            "32-bit (thumbv7em, thumbv8m, riscv32imac/imafc)",
+            1024,
+            8,
+            8
+        ),
+        row!(
+            "32-bit (thumbv7em, thumbv8m, riscv32imac/imafc)",
+            4096,
+            8,
+            8
+        ),
+        row!(
+            "32-bit (thumbv7em, thumbv8m, riscv32imac/imafc)",
+            8192,
+            8,
+            8
+        ),
         row!("64-bit (the oracle's host)", 1024, 8, 16),
         row!("64-bit (the oracle's host)", 4096, 8, 16),
         row!("64-bit (the oracle's host)", 8192, 8, 16),
