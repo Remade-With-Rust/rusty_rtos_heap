@@ -16,6 +16,9 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+pub mod heap4;
+
+pub use heap4::Heap4;
 pub use rusty_rtos_core as rtos_core;
 
 /// The names a firmware wants in scope.
