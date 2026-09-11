@@ -405,6 +405,40 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
     }
 }
 
+/// The footprint identity, checked ON EVERY TARGET the gate builds.
+///
+/// A `Heap4` costs its arena plus a FIXED bookkeeping block — the free
+/// counters, the two sentinels and the init flag — and nothing that grows
+/// with `N`. A host test can print the bytes but cannot prove this for a
+/// 32-bit target, because `size_of` there answers about the host's
+/// pointers. A `const` assertion can: it is evaluated by the compiler for
+/// whichever target is being built, so `kairos check`'s four bare-metal
+/// rungs verify it on ARMv7-M, ARMv8-M and both RISC-V profiles.
+///
+/// Expressed as an identity rather than a literal because the literal
+/// differs by pointer width, and a number that has to be edited per target
+/// is a number that stops being checked.
+const _: () = {
+    let small = size_of::<Heap4<1024, 8, 8>>() - 1024;
+    let large = size_of::<Heap4<8192, 8, 8>>() - 8192;
+    assert!(
+        small == large,
+        "heap_4's bookkeeping grew with the arena: it is not fixed overhead"
+    );
+};
+
+const _: () = {
+    let thirty_two = Heap4::<1024, 8, 8>::STRUCT_SIZE;
+    let sixty_four = Heap4::<1024, 8, 16>::STRUCT_SIZE;
+    // The header is one pointer plus one `size_t`, so the 64-bit geometry
+    // costs exactly twice the 32-bit one — and the minimum block, which is
+    // twice the header, moves with it. This is the line a firmware sizing
+    // an arena needs, and it is asserted rather than described.
+    assert!(sixty_four == thirty_two * 2);
+    assert!(Heap4::<1024, 8, 8>::MINIMUM_BLOCK_SIZE == thirty_two * 2);
+    assert!(Heap4::<1024, 8, 16>::MINIMUM_BLOCK_SIZE == sixty_four * 2);
+};
+
 impl<const N: usize, const ALIGN: usize, const LINK: usize> Default for Heap4<N, ALIGN, LINK> {
     fn default() -> Self {
         Self::new()
