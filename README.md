@@ -14,6 +14,9 @@ against the C by a differential over 20,000 operations. `#![forbid(unsafe_code)]
   diffed operation-for-operation against `heap_4.c` compiled verbatim from the
   pinned kernel — agreeing on the offset chosen, the free bytes remaining and
   the minimum ever free. **K4 passed 2026-09-10.**
+- **The protector is the one the representation needs**, not the C's: a
+  generational handle that refuses a double free, a stale free and an
+  interior offset — the last of which `heap_4.c` does not catch.
 - **The RAM cost is an identity**: `total = arena + bookkeeping`, remainder 0,
   bookkeeping a fixed 56 bytes — asserted by the compiler on all four
   bare-metal targets, not just measured on the host.
@@ -75,6 +78,49 @@ rungs — it cannot be true on the host and quietly false on the chip.
 Per profile means **per pointer width**: the block header is 8 bytes on every
 Kairos target and 16 on the oracle's host, and the minimum block size moves
 with it.
+
+### The protector, and why it is not the C's
+
+`heap_4.c`'s `configENABLE_HEAP_PROTECTOR` does two things: it XORs free-list
+**pointers** with a random canary, and it range-checks them. The canary exists
+because a corrupted free-list pointer in C is an arbitrary-write primitive.
+
+**That primitive does not exist here.** This heap holds bounds-checked `u64`
+offsets in a crate that is `#![forbid(unsafe_code)]`, so a corrupted offset is
+a wrong answer, never a write to an address somebody chose. Transcribing the
+XOR would carry a mitigation across to a bug class the representation already
+removed — and it would make the differential harder rather than the heap safer.
+
+What survives the change of representation is the failure the canary was never
+aimed at, plus two the C only half-checks:
+
+| | `heap_4.c` | here |
+|---|---|---|
+| double free | `configASSERT`, then nothing in a release build | **`Error::Gone`** |
+| freeing a **reallocated** block | undetectable — the block IS allocated | **`Error::Gone`**, via the generation |
+| an **interior** offset | passes: `heapVALIDATE_BLOCK_POINTER` only range-checks, then reads a header out of user data | **`Error::InvalidArgument`**, on the alignment |
+| out of range | `configASSERT` | **`Error::InvalidArgument`** |
+
+`alloc` answers with a [`Block`] — eight bytes, `Copy`, carrying the offset and
+the generation it was handed out under — and the generation is stamped into the
+block's link word, which the C writes `NULL` to and nobody reads while the
+block is live. **The protector therefore costs one counter and no extra
+memory**: the store already happened.
+
+`free` now returns a `Result` rather than `()`. That is the smaller half of
+this change and the more useful one: silently ignoring a double free is worse
+than the C, which at least stops in a debug build. Nothing is corrupted either
+way — what changes is that the caller can tell.
+
+**The generation is not optional, where the C's protector is.** The C makes it
+a config because the canary costs cycles and a word of RAM; this costs a store
+that was already being made, so there is no version of the package worth
+shipping without it.
+
+**It did not move the differential.** The same 20,000 operations still agree
+with `heap_4.c` on the offset chosen, the free bytes remaining and the minimum
+ever free — and the differential now also asserts, 20,000 times, that the
+protector never refuses a legitimate free.
 
 **Still open:** `heap_1` and `heap_5` are not written. `heap_3` — the seam over
 `rusty_alloc` small-metal and `esp-alloc` — is not here either. This crate is

@@ -35,6 +35,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use rusty_rtos_heap_core::Heap4;
+use rusty_rtos_heap_core::heap4::Block;
 
 /// The C driver's arena, alignment and `sizeof( BlockLink_t )`.
 const TOTAL: usize = 8192;
@@ -81,7 +82,10 @@ fn our_heap4_matches_the_c_kernels_operation_for_operation() {
     );
 
     let mut heap: Heap4<TOTAL, ALIGN, LINK> = Heap4::new();
-    let mut slots: [Option<u64>; SLOTS] = [None; SLOTS];
+    // The slots hold HANDLES now, not offsets: a handle carries the
+    // generation the protector checks, and holding one across a free and a
+    // reallocation is exactly the stale-handle case it exists to refuse.
+    let mut slots: [Option<Block>; SLOTS] = [None; SLOTS];
     let mut rng = Lcg::new();
     let mut compared = 0usize;
 
@@ -93,8 +97,11 @@ fn our_heap4_matches_the_c_kernels_operation_for_operation() {
         // the workspace forbids indexing that may panic, and a differential
         // that panics instead of reporting a mismatch is a worse instrument.
         let held = slots.get(slot).copied().flatten();
-        let ours = if let Some(offset) = held {
-            heap.free(offset);
+        let ours = if let Some(block) = held {
+            // Every free here is of a live handle, so a refusal would be the
+            // protector refusing something legitimate -- which this asserts
+            // 20,000 times over as a side effect of running the differential.
+            heap.free(block).expect("a live handle must free");
             if let Some(cell) = slots.get_mut(slot) {
                 *cell = None;
             }
@@ -112,7 +119,7 @@ fn our_heap4_matches_the_c_kernels_operation_for_operation() {
             if let Some(cell) = slots.get_mut(slot) {
                 *cell = got;
             }
-            let offset = got.map_or(-1i64, |o| o as i64);
+            let offset = got.map_or(-1i64, |b| i64::try_from(b.offset()).unwrap_or(-1));
             format!(
                 "alloc {slot} {size} {offset} {} {}",
                 heap.free_bytes(),

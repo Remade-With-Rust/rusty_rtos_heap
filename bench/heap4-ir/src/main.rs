@@ -31,7 +31,7 @@ fn main() {
         let slot = (r as usize) % SLOTS;
         let held = slots.get(slot).copied().flatten();
         if let Some(offset) = held {
-            heap.free(offset);
+            let _ = heap.free(offset);
             if let Some(cell) = slots.get_mut(slot) {
                 *cell = None;
             }

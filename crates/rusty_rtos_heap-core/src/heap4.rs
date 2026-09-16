@@ -39,6 +39,8 @@
 
 use core::mem::size_of;
 
+use rusty_rtos_core::error::{Error, Result};
+
 /// The free-list terminator. The C uses a null pointer; an offset of all
 /// ones cannot be a real offset into an arena that fits in memory.
 const NONE: u64 = u64::MAX;
@@ -54,6 +56,55 @@ const ALLOCATED_BIT: u64 = 1 << 63;
 const fn align_up(value: usize, align: usize) -> usize {
     let mask = align.saturating_sub(1);
     value.saturating_add(mask) & !mask
+}
+
+/// What [`Heap4::alloc`] answers with: where the block is, and **which**
+/// allocation it was.
+///
+/// # Why this is not just an offset
+///
+/// `heap_4.c` hands back a `void *` and takes it back in `vPortFree`, and it
+/// protects that round trip with three checks: the block must carry the
+/// allocated bit, its link must be null, and — with
+/// `configENABLE_HEAP_PROTECTOR` — free-list pointers are XORed with a random
+/// canary so a corrupted one is not a usable address.
+///
+/// **Two of those three do not transfer, and the third does not need to.**
+/// This heap holds bounds-checked `u64` offsets in a crate that is
+/// `#![forbid(unsafe_code)]`: a corrupted offset is a wrong answer, never a
+/// write to an address an attacker chose. Transcribing the canary would be
+/// carrying a mitigation across to a bug class the representation already
+/// removed.
+///
+/// What does survive the change of representation is the failure the canary
+/// was never aimed at: **freeing a block that has since been reallocated**.
+/// The allocated bit cannot see it — the block IS allocated, just not to you —
+/// and an offset alone cannot distinguish the allocation you were given from
+/// the one living there now. So the offset carries a generation, which is the
+/// same answer `rusty_rtos_core::Handle` already gives for the same question
+/// everywhere else in this family.
+///
+/// Eight bytes, `Copy`, and the offset is still available for anyone who needs
+/// the raw number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Block {
+    offset: u32,
+    generation: u32,
+}
+
+impl Block {
+    /// The user offset into the arena, which is what `heap_4.c`'s `void *`
+    /// stands for here.
+    #[must_use]
+    pub const fn offset(self) -> u64 {
+        self.offset as u64
+    }
+
+    /// Which allocation this was. Monotonic per heap.
+    #[must_use]
+    pub const fn generation(self) -> u32 {
+        self.generation
+    }
 }
 
 /// `heap_4.c` over an `N`-byte arena.
@@ -81,6 +132,14 @@ pub struct Heap4<const N: usize, const ALIGN: usize, const LINK: usize> {
     frees: usize,
     /// Whether `prvHeapInit` has run. The C tests `pxEnd == NULL`.
     initialised: bool,
+    /// The generation the next allocation is stamped with.
+    ///
+    /// Monotonic and never reused, so a [`Block`] from an earlier allocation
+    /// at the same offset cannot match the one living there now. It wraps
+    /// after 2^32 allocations, which is the one case a stale handle could
+    /// collide; at the 20,000 operations the differential runs that is not a
+    /// near thing, and a heap that reaches it has other problems.
+    next_generation: u32,
 }
 
 impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK> {
@@ -98,6 +157,7 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
             store: [0; N],
             start_next: NONE,
             end: NONE,
+            next_generation: 1,
             free_bytes: 0,
             minimum_ever_free: 0,
             allocations: 0,
@@ -252,7 +312,7 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
     /// address the C returns, which is the block plus its header.
     ///
     /// `None` is the C's `NULL`.
-    pub fn alloc(&mut self, wanted: usize) -> Option<u64> {
+    pub fn alloc(&mut self, wanted: usize) -> Option<Block> {
         if wanted == 0 {
             return None;
         }
@@ -331,32 +391,87 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
             self.minimum_ever_free = self.free_bytes;
         }
 
-        // `heapALLOCATE_BLOCK` and the null link the free path asserts on.
+        // `heapALLOCATE_BLOCK`, and then the link word.
+        //
+        // The C writes NULL there and `vPortFree` asserts on it. We write the
+        // GENERATION instead, which costs nothing: the store happens either
+        // way, and an allocated block's link is dead space in both designs.
+        // The allocated bit still distinguishes a live block from a free one,
+        // so the free path checks that first and never mistakes a free
+        // block's next pointer for a generation.
         self.set_raw_size(chosen, self.raw_size_of(chosen) | ALLOCATED_BIT);
-        self.set_next(chosen, NONE);
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        self.set_next(chosen, u64::from(generation));
         self.allocations = self.allocations.saturating_add(1);
-        Some(user)
+        Some(Block {
+            offset: u32::try_from(user).unwrap_or(u32::MAX),
+            generation,
+        })
     }
 
     // ---- vPortFree -----------------------------------------------------
 
-    /// `vPortFree`, taking the offset [`Heap4::alloc`] answered.
+    /// `vPortFree`, taking the [`Block`] [`Heap4::alloc`] answered.
     ///
-    /// A block that is not allocated, or whose link is not null, is
-    /// ignored — the C `configASSERT`s both and then does nothing, and
-    /// doing nothing is what a release build does.
-    pub fn free(&mut self, user: u64) {
+    /// # Why this reports instead of ignoring
+    ///
+    /// The C `configASSERT`s its checks and then does nothing, so a release
+    /// build silently ignores a bad free. This returned `()` and did the same,
+    /// which is worse than the C rather than equal to it: the C at least
+    /// stops in a debug build, and a caller here had no way to learn anything
+    /// at all. A silent no-op on a double free is a bug that erases its own
+    /// evidence.
+    ///
+    /// Nothing is corrupted either way — that is what `forbid(unsafe_code)`
+    /// and bounds-checked offsets buy. What changes is that the caller can
+    /// now tell.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::InvalidArgument`] — an offset this allocator could not have
+    ///   handed out: before the first block, past the arena, or not on an
+    ///   alignment boundary. That last one catches an INTERIOR offset, which
+    ///   `heapVALIDATE_BLOCK_POINTER` does not: the C only range-checks, so a
+    ///   pointer into the middle of a live block passes it and then reads a
+    ///   header out of user data.
+    /// * [`Error::Gone`] — the block is not allocated (a double free, or an
+    ///   offset that was never allocated), or it has been reallocated since
+    ///   this [`Block`] was handed out.
+    pub fn free(&mut self, block: Block) -> Result<()> {
+        let user = block.offset();
         let Some(link) = user.checked_sub(Self::STRUCT_SIZE as u64) else {
-            return;
+            return Err(Error::InvalidArgument);
         };
-        if !self.is_allocated(link) || self.next_of(link) != NONE {
-            return;
+        // `heapVALIDATE_BLOCK_POINTER`, and then the part it does not do.
+        // A block start is always aligned, so an offset that is not cannot
+        // name one -- which is the cheapest way to refuse an interior offset
+        // before it is used to read a header out of somebody's data.
+        // `checked_rem` rather than `%`: `ALIGN` is a const generic, so nothing
+        // stops a caller instantiating it at 0, and a remainder by zero
+        // panics. `None` then means "no alignment to be on", which is not an
+        // offset this allocator could have produced either -- so both arms of
+        // the comparison refuse, which is the answer wanted.
+        if link.saturating_add(Self::STRUCT_SIZE as u64) > N as u64
+            || link.checked_rem(ALIGN as u64) != Some(0)
+        {
+            return Err(Error::InvalidArgument);
+        }
+        // The allocated bit FIRST: a free block's link word holds a next
+        // pointer, and reading that as a generation is how this check would
+        // fool itself.
+        if !self.is_allocated(link) {
+            return Err(Error::Gone);
+        }
+        if self.next_of(link) != u64::from(block.generation()) {
+            return Err(Error::Gone);
         }
         // `heapFREE_BLOCK`.
         self.set_raw_size(link, self.raw_size_of(link) & !ALLOCATED_BIT);
         self.free_bytes = self.free_bytes.saturating_add(self.size_of(link) as usize);
         self.insert_into_free_list(link);
         self.frees = self.frees.saturating_add(1);
+        Ok(())
     }
 
     /// `prvInsertBlockIntoFreeList`: address-ordered insert that coalesces
@@ -546,5 +661,105 @@ const _: () = {
 impl<const N: usize, const ALIGN: usize, const LINK: usize> Default for Heap4<N, ALIGN, LINK> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::arithmetic_side_effects,
+    reason = "a test asserts; the crate's deny-by-default is for library code"
+)]
+mod protector_tests {
+    //! The refusals that need a FORGED offset.
+    //!
+    //! [`Block`] has no public constructor, deliberately: inventing one is the
+    //! bug the generation exists to catch. These live here, where the fields
+    //! are in scope, rather than widening the real API so an integration test
+    //! can reach them. The cases a caller could reach with a real handle --
+    //! double free, freeing a reallocated block -- are in `tests/protector.rs`.
+
+    use super::{Block, Heap4};
+    use rusty_rtos_core::error::Error;
+
+    const TOTAL: usize = 8192;
+    const ALIGN: usize = 8;
+    const LINK: usize = 8;
+
+    type Heap = Heap4<TOTAL, ALIGN, LINK>;
+
+    /// A handle no honest caller could hold.
+    const fn forged(offset: u64, generation: u32) -> Block {
+        Block {
+            offset: offset as u32,
+            generation,
+        }
+    }
+
+    /// An interior offset is refused -- and this is the case `heap_4.c` does
+    /// NOT catch.
+    ///
+    /// `heapVALIDATE_BLOCK_POINTER` only range-checks, so a pointer into the
+    /// middle of a live block is inside the heap, passes, and is then used to
+    /// read a header out of user data. A block start is always aligned, so an
+    /// offset that is not cannot name one -- the cheapest possible refusal.
+    #[test]
+    fn an_interior_offset_is_refused() {
+        let mut heap = Heap::new();
+        let block = heap.alloc(128).expect("room for 128 bytes");
+
+        let interior = forged(block.offset().saturating_add(1), block.generation());
+        assert_eq!(heap.free(interior), Err(Error::InvalidArgument));
+
+        assert_eq!(heap.free(block), Ok(()), "the real one still frees");
+    }
+
+    /// An offset past the arena is refused rather than silently ignored.
+    #[test]
+    fn an_offset_past_the_arena_is_refused() {
+        let mut heap = Heap::new();
+        let _ = heap.alloc(64).expect("lay the arena out");
+        let bogus = forged(TOTAL as u64 + ALIGN as u64, 1);
+        assert_eq!(heap.free(bogus), Err(Error::InvalidArgument));
+    }
+
+    /// An offset too small to carry a header behind it is refused.
+    #[test]
+    fn an_offset_below_the_first_header_is_refused() {
+        let mut heap = Heap::new();
+        let _ = heap.alloc(64).expect("lay the arena out");
+        assert_eq!(heap.free(forged(0, 1)), Err(Error::InvalidArgument));
+    }
+
+    /// An aligned, in-range offset that was never allocated is `Gone`.
+    ///
+    /// It lands inside the one big free block, whose allocated bit is clear --
+    /// which is the check that catches it, and the reason the allocated bit is
+    /// tested BEFORE the generation: a free block's link word holds a next
+    /// pointer, and reading that as a generation is how this check would fool
+    /// itself.
+    #[test]
+    fn an_offset_that_was_never_allocated_is_refused() {
+        let mut heap = Heap::new();
+        let live = heap.alloc(64).expect("room for 64 bytes");
+        let never = forged(live.offset().saturating_add(1024), 1);
+        assert_eq!(heap.free(never), Err(Error::Gone));
+        assert_eq!(heap.free(live), Ok(()));
+    }
+
+    /// A right offset with a wrong generation is refused.
+    ///
+    /// The narrowest case: everything about the handle is correct except which
+    /// allocation it names.
+    #[test]
+    fn the_right_offset_with_the_wrong_generation_is_refused() {
+        let mut heap = Heap::new();
+        let block = heap.alloc(64).expect("room for 64 bytes");
+
+        let wrong = forged(block.offset(), block.generation().wrapping_add(1));
+        assert_eq!(heap.free(wrong), Err(Error::Gone));
+        assert_eq!(heap.free(block), Ok(()));
     }
 }

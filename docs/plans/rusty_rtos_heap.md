@@ -119,7 +119,7 @@ Kairos's version is the seam over `rusty_alloc` small-metal
   detail — a seam over an allocator nobody has run on the target is a seam over
   an assumption.
 
-### 4. The protector — a decision before any code
+### 4. The protector — DECIDED AND BUILT 2026-09-16
 
 `configENABLE_HEAP_PROTECTOR` in the pinned kernel is two things:
 `heapPROTECT_BLOCK_POINTER( pxBlock )`, which XORs a free-list **pointer** with
@@ -149,16 +149,49 @@ shape of problem: `rusty_rtos_core`'s **generational handle**. An
 generation makes a double free and a stale free both `Error::Gone` rather than
 silent corruption — the same trade the kernel's arenas already make.
 
-**The decision to take:** whether `alloc` changes shape to carry a generation.
-It is a breaking API change, it costs bytes per block, and it diverges from
-`heap_4.c` — which means the differential needs a mode that switches it off, or
-the generation lives outside the blocks the differential compares. That is a
-design conversation, and it should happen before `heap_1` and `heap_5` are
-written rather than after, because both would inherit whatever is decided.
+**The decision taken:** `alloc` answers with a `Block` — offset plus
+generation, eight bytes, `Copy` — and `free` takes one and returns a `Result`.
+
+Two worries in the original framing turned out not to apply.
+
+*"It costs bytes per block."* It costs none. The generation is stamped into the
+block's link word, which `heap_4.c` writes `NULL` to on allocation and nobody
+reads while the block is live. The store already happened; only the value
+changed. The allocated bit still separates a live block from a free one, so the
+free path checks that FIRST and never mistakes a free block's next pointer for
+a generation.
+
+*"The differential needs a mode that switches it off."* It does not. The
+differential compares the offset chosen, the free bytes remaining and the
+minimum ever free — none of which the generation touches. All 20,000 operations
+still agree, and the differential now additionally asserts 20,000 times that
+the protector never refuses a legitimate free, which is a guard it did not have
+before.
+
+What the change did cost was the public shape of `alloc`, and that is a real
+divergence from `pvPortMalloc`. It is the same KIND of divergence the package
+already made deliberately when it chose offsets over pointers, for the same
+reason: a pointer is not comparable across two programs, and an offset alone
+cannot distinguish the allocation you were handed from the one living at that
+address now. `rusty_rtos_core::Handle` answers that question everywhere else in
+this family; the heap now answers it the same way.
+
+`free` also returns `Result` rather than `()`. That is the smaller half and the
+more useful one: the old code DETECTED a double free and then returned
+silently, which is worse than the C — the C at least stops in a debug build.
+Nothing was ever corrupted; the caller simply could not be told.
+
+Built with five unit tests for the cases needing a forged offset (interior, out
+of range, below the first header, never allocated, right offset with the wrong
+generation) and five integration tests for the ones a caller could really reach
+(double free, freeing a reallocated block, refused frees changing nothing,
+generations not repeating, the ordinary path unchanged). `Block` has no public
+constructor, which is why the forging tests live inside the module rather than
+widening the API to reach them.
 
 ### Order, and why
 
-`heap_1` → protector decision → `heap_5` → `heap_3`.
+`heap_1` → ~~protector decision~~ **(done 2026-09-16)** → `heap_5` → `heap_3`.
 
 `heap_1` first because it is small and it tests the harness. The protector
 decision next because `heap_5` would inherit the API. `heap_3` last because it
