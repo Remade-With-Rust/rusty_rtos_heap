@@ -39,6 +39,131 @@ Nothing yet. The facade re-exports the core; the core exposes `VERSION`.
 |---|---|---|---|
 | scaffold | the shape | K0 | a clean clone builds alone; CI green |
 
+## 4b. The K4 build map (2026-09-16)
+
+**K4's kill test passed on 2026-09-10** and the milestone row says so. What
+follows is the rest of K4's declared SCOPE, which is a different thing and is
+not built. The distinction matters because the row reads PASSED and a reader
+could reasonably conclude the package is finished.
+
+| K4 scope | state |
+|---|---|
+| `heap_4` | **built and proven** — 20,000 operations diffed against `heap_4.c` |
+| `StaticAllocation` first-class | **met, and in a stronger form than the C's** — the C demo shows a system *can* be built with `configSUPPORT_DYNAMIC_ALLOCATION 0`; here it cannot be built any other way, gated on the linked rlib and poison-proven both directions |
+| RAM table per profile | **met** — an identity, remainder 0, `const`-asserted on four rungs |
+| `heap_1` | not written |
+| `heap_5` | not written |
+| `heap_3` seam over `rusty_alloc` / `esp-alloc` | not written |
+| the protector | **needs a decision before it needs code** — see below |
+
+### The method is already proven, so reuse it rather than reinvent it
+
+The `heap_4` differential is the template and it works: transcribe the C's
+algorithm over **offsets**, compile the C arm **verbatim** from the pinned
+kernel, generate its trace once and check it in so the diff needs no C
+toolchain, then diff operation-for-operation on the quantities both sides can
+name — the offset chosen, free bytes remaining, minimum ever free.
+
+It also carries the lesson that makes it worth copying: **it passed first
+time, and that was the problem.** The first workload never refused a single
+request, so what agreed was the easy half of an allocator.
+`the_workload_reaches_the_branches_that_matter` is the guard against that, and
+every new differential below needs its own version of it. A differential whose
+workload cannot fail is a differential about nothing.
+
+### 1. `heap_1` — smallest, and worth doing first for that reason
+
+178 lines of C, and `vPortFree` is a no-op that asserts. Allocate-only, bump
+upward, never coalesce, never refuse except at exhaustion.
+
+* **Build:** `Heap1<N, ALIGN>` beside `Heap4`, same const-generic shape.
+* **Kill test:** the same differential harness, pointed at `heap_1.c`. The
+  branch guard is inverted here — the workload must reach **exhaustion**,
+  because refusal is the only interesting branch a bump allocator has.
+* **Why first:** it is a day's work and it proves the differential harness
+  generalises beyond the allocator it was written for. If the harness needs
+  changing to accept a second allocator, better to learn that on the easy one.
+
+### 2. `heap_5` — `heap_4` over non-contiguous regions
+
+756 lines of C, which is the biggest of them because it is heap_4 plus region
+handling. Adds `vPortDefineHeapRegions( const HeapRegion_t * )`, and with it
+`vPortGetHeapStats` and `xPortResetHeapMinimumEverFreeHeapSize`.
+
+* **The real question is representation, not algorithm.** `Heap4` uses an
+  offset into one arena. Multiple regions means an offset is no longer
+  self-describing: either a `(region, offset)` pair, or one global offset space
+  with a region table mapping ranges. The second keeps the existing free-list
+  code and the existing differential unchanged, and is what the C effectively
+  does by linking regions into one address-ordered list.
+* **Build:** reuse `Heap4`'s free list wholesale; the difference is
+  initialisation and the bounds check.
+* **Kill test:** the differential with **three regions of different sizes,
+  defined out of address order** — the C sorts them, and a transcription that
+  assumed sorted input would pass a one-region test and fail here. That is the
+  branch guard for this one.
+
+### 3. `heap_3` — a seam, not an algorithm
+
+106 lines of C, and all of them wrap `malloc`/`free` in a critical section.
+Kairos's version is the seam over `rusty_alloc` small-metal
+(`prim::fixed::Region<N>`) and `esp-alloc`.
+
+* **There is no differential to write.** The C arm's behaviour is libc's, so
+  diffing against it would measure whichever libc the oracle linked. The kill
+  test is the seam's: the same kernel workload runs unchanged over this heap,
+  and the arena accounting still reconciles.
+* **Blocked on a measurement that is already recorded as owed:** the mission
+  plan's own row says `rusty_alloc`'s `prim::fixed` has been measured on the S3
+  only, and its behaviour on Cortex-M is unfiled. That is a prerequisite, not a
+  detail — a seam over an allocator nobody has run on the target is a seam over
+  an assumption.
+
+### 4. The protector — a decision before any code
+
+`configENABLE_HEAP_PROTECTOR` in the pinned kernel is two things:
+`heapPROTECT_BLOCK_POINTER( pxBlock )`, which XORs a free-list **pointer** with
+a random canary, and `heapVALIDATE_BLOCK_POINTER`, which asserts the pointer
+lies inside the heap.
+
+**Most of what it protects against, this representation has already removed.**
+The canary exists because a corrupted free-list pointer in C is an arbitrary
+write primitive. `Heap4` holds `u64` offsets, bounds-checked on use, in a crate
+that is `#![forbid(unsafe_code)]` — a corrupted offset is a wrong answer, not a
+write to an attacker's address. Transcribing the XOR verbatim would be
+cargo-culting a mitigation for a bug class that cannot occur here, and it would
+make the differential harder rather than the heap safer.
+
+**What does survive the change of representation**, and is the real work:
+
+* **double free** — freeing an offset twice is still possible and still
+  corrupts the free list;
+* **a stale offset** — freeing an offset from a previous allocation at the same
+  place, which is the offset-world equivalent of a dangling pointer;
+* **a bogus offset** — one that never came from `alloc`.
+
+The third is already handled by the bounds check. The first two are not, and
+the family already has the answer it uses everywhere else for exactly this
+shape of problem: `rusty_rtos_core`'s **generational handle**. An
+`alloc` that answers with `(offset, generation)` and a `free` that checks the
+generation makes a double free and a stale free both `Error::Gone` rather than
+silent corruption — the same trade the kernel's arenas already make.
+
+**The decision to take:** whether `alloc` changes shape to carry a generation.
+It is a breaking API change, it costs bytes per block, and it diverges from
+`heap_4.c` — which means the differential needs a mode that switches it off, or
+the generation lives outside the blocks the differential compares. That is a
+design conversation, and it should happen before `heap_1` and `heap_5` are
+written rather than after, because both would inherit whatever is decided.
+
+### Order, and why
+
+`heap_1` → protector decision → `heap_5` → `heap_3`.
+
+`heap_1` first because it is small and it tests the harness. The protector
+decision next because `heap_5` would inherit the API. `heap_3` last because it
+is blocked on a `rusty_alloc` measurement this plan does not own.
+
 ## 5. Deliberately absent
 
 To be written with the first milestone.
