@@ -604,12 +604,56 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         if self.next_of(link) != u64::from(block.generation()) {
             return Err(Error::Gone);
         }
+        self.free_at(link);
+        Ok(())
+    }
+
+    /// `vPortFree`, taking a bare offset — **the protection an address can
+    /// carry, which is `heap_4.c`'s and no more.**
+    ///
+    /// [`Self::free`] refuses a stale handle because a [`Block`] carries the
+    /// generation it was handed out under. A C caller has no [`Block`]:
+    /// `vPortFree( void * )` takes an address and nothing else, which is
+    /// exactly why `heap_4.c` can manage only the allocated-bit check itself.
+    /// So the C ABI uses this, and gets what FreeRTOS gets.
+    ///
+    /// That is a real difference and worth naming rather than blurring: a
+    /// double free is caught here, and a free of a REALLOCATED block is not,
+    /// because an address alone cannot distinguish the allocation you were
+    /// given from the one living there now. A Rust caller should use
+    /// [`Self::free`] and be told; a C caller cannot be, and the limit is the
+    /// C's type, not this heap's.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::InvalidArgument`] — an offset this allocator could not have
+    ///   handed out: before the first block, past the arena, or not on an
+    ///   alignment boundary.
+    /// * [`Error::Gone`] — the block is not allocated, which is a double free
+    ///   or an offset that was never allocated.
+    pub fn free_raw(&mut self, offset: u64) -> Result<()> {
+        let Some(link) = offset.checked_sub(Self::STRUCT_SIZE as u64) else {
+            return Err(Error::InvalidArgument);
+        };
+        if link.saturating_add(Self::STRUCT_SIZE as u64) > N as u64
+            || link.checked_rem(ALIGN as u64) != Some(0)
+        {
+            return Err(Error::InvalidArgument);
+        }
+        if !self.is_allocated(link) {
+            return Err(Error::Gone);
+        }
+        self.free_at(link);
+        Ok(())
+    }
+
+    /// The part of `vPortFree` after the checks, shared by both entry points.
+    fn free_at(&mut self, link: u64) {
         // `heapFREE_BLOCK`.
         self.set_raw_size(link, self.raw_size_of(link) & !ALLOCATED_BIT);
         self.free_bytes = self.free_bytes.saturating_add(self.size_of(link) as usize);
         self.insert_into_free_list(link);
         self.frees = self.frees.saturating_add(1);
-        Ok(())
     }
 
     /// `prvInsertBlockIntoFreeList`: address-ordered insert that coalesces

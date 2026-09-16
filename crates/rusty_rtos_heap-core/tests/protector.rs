@@ -169,3 +169,48 @@ fn the_ordinary_path_is_unchanged() {
         "every byte came back, so the three blocks coalesced into one"
     );
 }
+
+/// `free_raw` is the protection an ADDRESS can carry, and no more.
+///
+/// The C ABI uses it, because `vPortFree( void * )` has nowhere to put a
+/// generation. So this pins the exact difference: a double free is caught, a
+/// free of a REALLOCATED block is not. That is FreeRTOS's own guarantee, and
+/// the limit is the C's type rather than this heap's.
+///
+/// Worth a standing test because the two are one keystroke apart at a call
+/// site, and picking the wrong one silently downgrades a Rust caller.
+#[test]
+fn free_raw_catches_a_double_free_but_not_a_stale_one() {
+    let mut heap = Heap::new();
+
+    // A double free IS caught, exactly as `heap_4.c` catches it.
+    let block = heap.alloc(64).expect("room");
+    assert_eq!(heap.free_raw(block.offset()), Ok(()));
+    assert_eq!(heap.free_raw(block.offset()), Err(Error::Gone));
+
+    // A stale free is NOT, because an address cannot say which allocation it
+    // meant. The block below comes back at the same offset, and `free_raw`
+    // frees the LIVE one when handed the dead one's address.
+    let first = heap.alloc(64).expect("room");
+    assert_eq!(heap.free(first), Ok(()));
+    let second = heap.alloc(64).expect("the same room again");
+    assert_eq!(
+        second.offset(),
+        first.offset(),
+        "same place, new allocation"
+    );
+
+    assert_eq!(
+        heap.free_raw(first.offset()),
+        Ok(()),
+        "an address cannot carry which allocation it meant, so this frees the          live block -- which is what FreeRTOS does too"
+    );
+    // And the stronger entry point would have refused exactly that.
+    let third = heap.alloc(64).expect("room");
+    assert_eq!(
+        heap.free(second),
+        Err(Error::Gone),
+        "the Block form refuses it"
+    );
+    assert_eq!(heap.free(third), Ok(()));
+}
