@@ -39,6 +39,16 @@ extern void kairos_heap4_assert_failed( const char * pcWhat );
 #define traceMALLOC( pvReturn, xWantedSize )
 #define traceFREE( pv, xBlockSize )
 
+/* `HeapRegion_t` lives in `portable.h` in the real kernel, which these shims
+ * do not provide. heap_5.c needs it and heap_4.c does not, which is why it
+ * arrives here only now: the shims grow when a file being compiled verbatim
+ * asks for something, never ahead of that. */
+typedef struct HeapRegion
+{
+    uint8_t * pucStartAddress;
+    size_t    xSizeInBytes;
+} HeapRegion_t;
+
 typedef struct xHeapStats
 {
     size_t xAvailableHeapSpaceInBytes;

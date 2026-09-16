@@ -52,7 +52,7 @@ could reasonably conclude the package is finished.
 | `StaticAllocation` first-class | **met, and in a stronger form than the C's** — the C demo shows a system *can* be built with `configSUPPORT_DYNAMIC_ALLOCATION 0`; here it cannot be built any other way, gated on the linked rlib and poison-proven both directions |
 | RAM table per profile | **met** — an identity, remainder 0, `const`-asserted on four rungs |
 | `heap_1` | **built and proven** -- 2,000 operations, 1,973 of them refusals |
-| `heap_5` | not written |
+| `heap_5` | **built and proven** -- 20,000 operations over three regions |
 | `heap_3` seam over `rusty_alloc` / `esp-alloc` | not written |
 | the protector | **needs a decision before it needs code** — see below |
 
@@ -108,7 +108,7 @@ workload cannot fail is a differential about nothing.
 optional: weakening the strictly-less-than bound to `>` diverges at operation
 42 -- ours accepts an allocation at offset 8,152 that the C refuses.
 
-### 2. `heap_5` — `heap_4` over non-contiguous regions
+### 2. `heap_5` — BUILT 2026-09-16
 
 756 lines of C, which is the biggest of them because it is heap_4 plus region
 handling. Adds `vPortDefineHeapRegions( const HeapRegion_t * )`, and with it
@@ -122,10 +122,35 @@ handling. Adds `vPortDefineHeapRegions( const HeapRegion_t * )`, and with it
   does by linking regions into one address-ordered list.
 * **Build:** reuse `Heap4`'s free list wholesale; the difference is
   initialisation and the bounds check.
-* **Kill test:** the differential with **three regions of different sizes,
-  defined out of address order** — the C sorts them, and a transcription that
-  assumed sorted input would pass a one-region test and fail here. That is the
-  branch guard for this one.
+* **Kill test as built:** three regions of different sizes with real gaps,
+  20,000 operations, allocations landing in all three (5,717 / 1,581 / 2,332).
+  The guard fails if any region is allocated in fewer than a hundred times — a
+  three-region differential that only ever reaches the first one is a
+  one-region differential in a costume.
+
+**The plan's branch guard was wrong, and the C said so.** It read "defined out
+of address order — the C sorts them". The C does not sort: it asserts.
+
+```c
+/* Check blocks are passed in with increasing start addresses. */
+configASSERT( ( size_t ) xAddress > ( size_t ) pxEnd );
+```
+
+So accepting unsorted regions would have been the bug, not refusing them. That
+is the second time in this milestone that reading the pinned source corrected a
+plan written from memory — the first was `heap_1`'s `vPortFree`, which is an
+assertion and not a no-op. The oracle is pinned so it can be read; a plan is a
+hypothesis about it.
+
+**And a test that failed taught the more interesting fact.** It was written to
+assert that two ABUTTING regions coalesce, "because then they are one region".
+They do not: every region reserves its own end marker at its top, so region
+0's block ends at its marker rather than at region 1's start, and the addresses
+never meet. `vPortDefineHeapRegions` is not a way to describe one arena in
+pieces — each piece costs a marker and none of them merge.
+
+**Poison-proven:** letting each region's block claim eight bytes it does not
+own diverges from the C immediately.
 
 ### 3. `heap_3` — a seam, not an algorithm
 
@@ -215,7 +240,7 @@ widening the API to reach them.
 
 ### Order, and why
 
-~~`heap_1`~~ → ~~protector decision~~ **(both done 2026-09-16)** → `heap_5` → `heap_3`.
+~~`heap_1`~~ → ~~protector~~ → ~~`heap_5`~~ **(all done 2026-09-16)** → `heap_3`.
 
 `heap_1` first because it is small and it tests the harness. The protector
 decision next because `heap_5` would inherit the API. `heap_3` last because it

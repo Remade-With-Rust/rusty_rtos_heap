@@ -107,10 +107,37 @@ impl Block {
     }
 }
 
-/// `heap_4.c` over an `N`-byte arena.
+/// One region of a `heap_5` heap: where it starts in the arena, and how big.
+///
+/// `HeapRegion_t` in the C, over offsets rather than a pointer. The space
+/// between two regions is a real gap that no allocation crosses — which is
+/// enforced by arithmetic rather than by a check, since coalescing is an
+/// address comparison and a gap makes it false.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Region {
+    /// Where the region starts, as an offset into the arena.
+    pub start: usize,
+    /// How many bytes it covers.
+    pub size: usize,
+}
+
+impl Region {
+    /// A region at `start` covering `size` bytes.
+    #[must_use]
+    pub const fn new(start: usize, size: usize) -> Self {
+        Self { start, size }
+    }
+}
+
+/// `heap_4.c` over an `N`-byte arena — and, initialised with
+/// [`Heap4::define_regions`], `heap_5.c` over several.
 ///
 /// * `ALIGN` is `portBYTE_ALIGNMENT`.
 /// * `LINK` is `sizeof( BlockLink_t )` — one pointer plus one `size_t`.
+///
+/// The two C files share `pvPortMalloc`, `vPortFree` and
+/// `prvInsertBlockIntoFreeList` almost line for line and differ only in
+/// initialisation, so there is one free list here and two ways to lay it out.
 #[derive(Debug)]
 pub struct Heap4<const N: usize, const ALIGN: usize, const LINK: usize> {
     /// The arena. Block headers live inside it, where the C puts them.
@@ -304,6 +331,117 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
 
         self.free_bytes = first_size;
         self.minimum_ever_free = first_size;
+    }
+
+    // ---- vPortDefineHeapRegions ----------------------------------------
+
+    /// `vPortDefineHeapRegions`, which is `heap_5.c`'s initialiser.
+    ///
+    /// Each region becomes a free block covering it, plus an end marker at its
+    /// top; the previous region's marker is then pointed at the next region's
+    /// block, so one address-ordered free list threads all of them. That is
+    /// exactly what the C does with pointers, over offsets instead.
+    ///
+    /// # The gaps have to be real
+    ///
+    /// Regions are sub-ranges of this arena, and the space BETWEEN them must
+    /// be left alone. That is not bookkeeping: coalescing in
+    /// [`Self::insert_into_free_list`] is an address comparison, and what
+    /// stops two regions merging into one is that the first one's end is not
+    /// the second one's start. Declare regions that abut and they will
+    /// coalesce, correctly, because then they are one region.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Busy`] — already initialised. The C is blunter:
+    ///   `configASSERT( pxEnd == NULL )` under the comment "Can only call
+    ///   once!".
+    /// * [`Error::InvalidArgument`] — no regions, a region that does not fit
+    ///   the arena, one too small to hold its own end marker, or regions
+    ///   **out of address order**.
+    ///
+    /// That last one is the C's behaviour and not a convenience of ours:
+    ///
+    /// ```c
+    /// /* Check blocks are passed in with increasing start addresses. */
+    /// configASSERT( ( size_t ) xAddress > ( size_t ) pxEnd );
+    /// ```
+    ///
+    /// It does **not** sort them. The plan for this work assumed it did, and
+    /// assumed a transcription that expected sorted input would be the bug;
+    /// the C says the opposite, so accepting unsorted regions would be the
+    /// bug. Reading the source settled it, which is the whole reason the
+    /// oracle is pinned.
+    pub fn define_regions(&mut self, regions: &[Region]) -> Result<()> {
+        if self.initialised {
+            return Err(Error::Busy);
+        }
+        if regions.is_empty() {
+            return Err(Error::InvalidArgument);
+        }
+
+        let mask = ALIGN.saturating_sub(1);
+        let mut previous_end: Option<u64> = None;
+        let mut total = 0usize;
+
+        for region in regions {
+            // `xAddress` aligned UP, with the loss taken out of the size --
+            // the C adjusts `xTotalRegionSize` by exactly what alignment cost.
+            let start = region.start.saturating_add(mask) & !mask;
+            let lost = start.saturating_sub(region.start);
+            let size = region.size.saturating_sub(lost);
+
+            // The end marker sits at the top, aligned DOWN.
+            let raw_end = start.saturating_add(size).saturating_sub(Self::STRUCT_SIZE);
+            let end = raw_end & !mask;
+
+            // A region must fit, and must have room for a block AND its marker.
+            if start.saturating_add(size) > N
+                || end <= start
+                || end.saturating_add(Self::STRUCT_SIZE) > N
+            {
+                return Err(Error::InvalidArgument);
+            }
+
+            let start = start as u64;
+            let end = end as u64;
+
+            // Increasing start addresses, which the C asserts rather than sorts.
+            if let Some(previous) = previous_end {
+                if start <= previous {
+                    return Err(Error::InvalidArgument);
+                }
+            }
+
+            self.set_raw_size(end, 0);
+            self.set_next(end, NONE);
+
+            let block_size = end.saturating_sub(start);
+            self.set_raw_size(start, block_size);
+            self.set_next(start, end);
+
+            match previous_end {
+                // `xStart.pxNextFreeBlock = xAlignedHeap` for the first region.
+                None => self.start_next = start,
+                // Otherwise the PREVIOUS region's marker points at this block,
+                // which is what threads the regions into one list.
+                Some(previous) => self.set_next(previous, start),
+            }
+
+            total = total.saturating_add(block_size as usize);
+            previous_end = Some(end);
+            self.end = end;
+        }
+
+        // `configASSERT( xTotalHeapSize )`.
+        if total == 0 {
+            return Err(Error::InvalidArgument);
+        }
+
+        self.initialised = true;
+        self.free_bytes = total;
+        self.minimum_ever_free = total;
+        Ok(())
     }
 
     // ---- pvPortMalloc --------------------------------------------------

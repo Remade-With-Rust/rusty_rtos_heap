@@ -14,6 +14,8 @@ against the C by a differential over 20,000 operations. `#![forbid(unsafe_code)]
   diffed operation-for-operation against `heap_4.c` compiled verbatim from the
   pinned kernel — agreeing on the offset chosen, the free bytes remaining and
   the minimum ever free. **K4 passed 2026-09-10.**
+- **`heap_5` too**, the same free list laid out over several regions with
+  real gaps — 20,000 operations, allocations landing in all three.
 - **`heap_1` too**, allocate-only, proven the same way -- with its guard
   inverted, because refusal is the only branch a bump allocator has.
 - **The protector is the one the representation needs**, not the C's: a
@@ -23,7 +25,7 @@ against the C by a differential over 20,000 operations. `#![forbid(unsafe_code)]
   bookkeeping a fixed 56 bytes — asserted by the compiler on all four
   bare-metal targets, not just measured on the host.
 
-**Known gaps.** `heap_5` is not written, and neither is
+**Known gaps.** `heap_3` is not written —
 `heap_3` (the seam over `rusty_alloc` small-metal and `esp-alloc`). This crate
 is `heap_4` and the RAM identity. Note also that the kernel does **not need**
 it: Kairos places every object in an arena declared at compile time, which is
@@ -155,7 +157,43 @@ than, so the last bytes can never be handed out; and the usable arena is
 to `ALIGN - 1` bytes doing it. We lose none and subtract it anyway, because the
 size this allocator refuses on has to be the size the C refuses on.
 
-**Still open:** `heap_5` is not written. `heap_3` — the seam over
+### `heap_5`, which is `heap_4` over several regions
+
+`heap_5.c` and `heap_4.c` share `pvPortMalloc`, `vPortFree` and
+`prvInsertBlockIntoFreeList` almost line for line; only initialisation
+differs. So there is **one free list here and two ways to lay it out**, rather
+than the duplication the two C files carry — copying that would copy its cost,
+two homes for one bug.
+
+**20,000 operations across three regions** agree with the C: a 4 KiB, a 2 KiB
+and a 4 KiB region with real 512-byte gaps between them, and allocations land
+in all three (5,717 / 1,581 / 2,332).
+
+The gaps are the point. Coalescing is an address comparison, so what stops two
+regions merging is that the first one's end is not the second one's start. A
+transcription that quietly treated the arena as contiguous would hand out a
+block spanning a gap, and a standing test checks every allocation against both
+gaps for exactly that.
+
+**Two things the C decided, that the plan for this work had guessed wrong:**
+
+* **Regions must arrive in increasing address order, and the C asserts it
+  rather than sorting** — `configASSERT( ( size_t ) xAddress > ( size_t )
+  pxEnd )`, under the comment "Check blocks are passed in with increasing
+  start addresses". The plan had assumed the C sorted them and that expecting
+  sorted input would be the bug; it is the opposite, so out-of-order regions
+  are refused.
+* **Even ABUTTING regions do not merge.** A test written to assert they would
+  failed: every region reserves its own end marker at its top, so region 0's
+  block ends at its marker and not at region 1's start. The addresses never
+  meet. `vPortDefineHeapRegions` is therefore not a way to describe one arena
+  in pieces — each piece costs a marker and none of them merge.
+
+**Poison-proven.** Letting each region's block claim eight bytes it does not
+own diverges from the C immediately.
+
+**Still open:** `heap_3`, the seam over `rusty_alloc` small-metal and
+`esp-alloc`. `heap_3` — the seam over
 `rusty_alloc` small-metal and `esp-alloc` — is not here either. This crate is
 `heap_4` and the RAM identity, and nothing else claims to exist.
 
