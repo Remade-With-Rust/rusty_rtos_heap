@@ -17,10 +17,19 @@
 extern crate alloc;
 
 pub mod heap1;
+/// `heap_3.c`: the platform's allocator behind the family's heap surface.
+///
+/// Needs `alloc`, which is the honest dependency: it IS the "use the
+/// platform's allocator" heap, so a build without one has nothing to route
+/// to.
+#[cfg(feature = "alloc")]
+pub mod heap3;
 pub mod heap4;
 pub mod heap5;
 
 pub use heap1::Heap1;
+#[cfg(feature = "alloc")]
+pub use heap3::Heap3;
 pub use heap4::{Heap4, Region};
 pub use heap5::Heap5;
 pub use rusty_rtos_core as rtos_core;

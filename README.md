@@ -25,7 +25,8 @@ against the C by a differential over 20,000 operations. `#![forbid(unsafe_code)]
   bookkeeping a fixed 56 bytes — asserted by the compiler on all four
   bare-metal targets, not just measured on the host.
 
-**Known gaps.** `heap_3` is not written —
+**Known gaps.** `heap_3` cannot be proven against the C the way the other
+three are —
 `heap_3` (the seam over `rusty_alloc` small-metal and `esp-alloc`). This crate
 is `heap_4` and the RAM identity. Note also that the kernel does **not need**
 it: Kairos places every object in an arena declared at compile time, which is
@@ -192,8 +193,39 @@ gaps for exactly that.
 **Poison-proven.** Letting each region's block claim eight bytes it does not
 own diverges from the C immediately.
 
-**Still open:** `heap_3`, the seam over `rusty_alloc` small-metal and
-`esp-alloc`. `heap_3` — the seam over
+### `heap_3`, and the claim it cannot make
+
+`heap_3.c` is thirty lines and all of them are `malloc` / `free` inside
+`vTaskSuspendAll()` / `xTaskResumeAll()`. **Its entire content is the lock, not
+the allocation.**
+
+Ours routes to the **global** allocator — whatever the deliverable declared —
+rather than to a named one. A seam that named `rusty_alloc` would be choosing
+for the consumer, and choosing badly for much of the hardware FreeRTOS exists
+to serve: `rusty_alloc`'s `MIN_REGION` is **65,536 bytes**, the entire SRAM of
+a classic FreeRTOS QEMU target, while `heap_4` runs in whatever arena you
+declare and its differential runs in 8 KiB. Those are different floor
+*functions*, not one tuned differently.
+
+**There is no differential, and that is structural.** `heap_3.c` forwards to
+`malloc`, so diffing against it would compare whichever libc the oracle linked
+with whichever global allocator the binary declared — two third parties, called
+conformance. The claim here is a different KIND and is labelled as such: the
+same 20,000-operation workload runs over an external allocator and **the
+accounting reconciles exactly** — allocations equal frees, live bytes zero,
+live slots zero.
+
+**It hands out a handle, not a pointer**, and the lint is why. The first draft
+returned `*mut u8` and needed `unsafe` for the raw allocation, the header
+arithmetic and the `Layout` reconstruction; this crate is
+`#![forbid(unsafe_code)]` and the family keeps its `unsafe` in the port crates.
+The lint was right — a handle is what the rest of the family hands out, and it
+removes the same bug class here. `Box<[u8]>` owns the bytes, so a double free
+and a free of a reused slot are both refused, which `heap_3.c` cannot do at
+all.
+
+**Still open:** nothing in this package. `heap_1`, `heap_3`, `heap_4` and
+`heap_5` are all built. `heap_3` — the seam over
 `rusty_alloc` small-metal and `esp-alloc` — is not here either. This crate is
 `heap_4` and the RAM identity, and nothing else claims to exist.
 

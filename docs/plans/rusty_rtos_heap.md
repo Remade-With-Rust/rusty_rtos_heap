@@ -152,7 +152,112 @@ pieces — each piece costs a marker and none of them merge.
 **Poison-proven:** letting each region's block claim eight bytes it does not
 own diverges from the C immediately.
 
-### 3. `heap_3` — a seam, not an algorithm
+### 3. `heap_3` — the battlefield, mapped 2026-09-16
+
+**The blocker this plan recorded was stale.** It said `rusty_alloc`'s
+`prim::fixed` was "measured on the S3 only" and unfiled on Cortex-M. It has run
+on a Cortex-M3 since 2026-09-10 and still does — re-run today,
+`rusty_rtos_core/firmware/mps2-an385-qemu-region`, **9/9**: `give()` answering
+196,608 usable bytes, a second `give()` refused with `FERR_REGISTERED`, a `Box`
+and a collection served, and every allocation proven inside the region by
+`region_contains`. `build-me-bare` B4a closed it and this plan was not updated.
+
+So the correctness question is answered. What follows is the rest of the
+ground, because the interesting part was never whether it works.
+
+#### The two floors are different FUNCTIONS
+
+| | floor |
+|---|---|
+| `heap_4` | `bytes_live + header` — 8 bytes per block, in whatever arena you declare. The differential runs in **8 KiB** |
+| `rusty_alloc` | `segments x 64 KiB` — **`MIN_REGION` is 65,536 bytes**, `REGION_ALIGN` 16, and a region is whole segments: 225,280 asked gives 196,608 reserved |
+
+That is not one function tuned differently, it is two shapes. `heap_4`'s cost
+follows what you use; `rusty_alloc`'s does not depend on what you allocate at
+all.
+
+**And the consequence has already bitten this repository once.** The M3 region
+cell had to move from `lm3s6965evb` to `mps2-an385` for a reason that is
+arithmetic rather than taste:
+
+```text
+MIN_REGION      65536 bytes    one segment at this geometry
+LM3S6965 SRAM   65536 bytes    the whole chip
+```
+
+The smallest region the allocator accepts **is the entire SRAM** of a classic
+FreeRTOS QEMU target, leaving nothing for stack, `.data` or `.bss`. A great
+many of the parts FreeRTOS exists for cannot run `rusty_alloc` at all.
+
+#### Speed, from silicon, with a zero-cycle null arm
+
+`esp32s3-devkit-alloc-ab`, `heap_4.c` compiled verbatim with
+`xtensa-esp32s3-elf-gcc` under the identical CCOUNT harness, arms ABBA
+interleaved, checksums compared, null A/B **0 cycles**:
+
+| request | `rusty_alloc` | `heap_4` | |
+|---|---:|---:|---|
+| 16 B | 99 | 236 | **2.38x faster** |
+| 32 B | 109 | 236 | 2.17x faster |
+| 64 B | 141 | 236 | 1.67x faster |
+| 128 B | 193 | 236 | 1.22x faster |
+| 256-512 B | 298 | 236 | **1.27x SLOWER** |
+| 1024-2048 B | 255 | 236 | 1.08x slower |
+
+A crossover, not a win — and `heap_4`'s flat 236 is its **best case**, which
+that row says out loud: the workload keeps one block live, so the free list is
+one entry and first fit answers in one step.
+
+#### What is genuinely outstanding, and it is hardware
+
+`build-me-bare` B4b wants that cycle row on a **Kairos target**. The Xtensa arm
+is done; the riscv32 arm needs an ESP32-C6, and none is in hand. **QEMU cannot
+substitute**, which the M3 cell measured rather than assumed: DWT `CYCCNT`
+reads **0**, and SysTick deltas SHRINK as the loop grows — 848 / 548 / 353 for
+1k / 2k / 4k iterations — because they track host wall time while TCG's
+translation cache warms, not guest work. Under `-icount shift=0` they read
+1 / 0 / 0. A cell that cannot count cannot supply a number.
+
+#### The thing `heap_3` would have to solve that `heap_3.c` does not
+
+`heap_3.c` is thirty lines and all of them are `malloc`/`free` inside
+`vTaskSuspendAll()` / `xTaskResumeAll()`. **Its entire content is the lock, not
+the allocation.**
+
+In Rust the platform allocator is the *global* allocator, and there is a
+mismatch the C does not have: `free( void * )` takes an address, and
+`alloc::alloc::dealloc` requires the `Layout` back. So a Rust `heap_3` must
+store the size it allocated — a header, which `heap_3.c` does not need because
+libc keeps that bookkeeping itself. That is a real divergence and it means a
+Rust `heap_3` is not quite the trivial forward the C is.
+
+#### The decision
+
+**Build it over the GLOBAL allocator, not over `rusty_alloc`.**
+
+`heap_3.c` routes to the platform's allocator. In Rust that is whatever the
+deliverable declared — the system allocator on a host, `rusty_alloc` on a
+firmware that registered a region, anything else a consumer chooses. A seam
+that named `rusty_alloc` would be choosing for them, and choosing badly for
+every part under 64 KiB.
+
+That also makes it the `Heap5` shape again: a thin type over machinery it does
+not own, exposing the same `alloc` / `free_raw` / `free_bytes` surface so a
+caller generic over the heaps sees one shape.
+
+**And its kill test is a different KIND of claim, which must be labelled.**
+There is no differential to write: diffing against `heap_3.c` would measure
+whichever libc the oracle linked, not ours. So the honest claim is "the same
+workload runs over an external allocator and the accounting reconciles", and it
+must not be presented as a fourth differential. Three allocators are proven
+against the C; a fourth that cannot be would dilute what "K4 passed" means if
+the difference were blurred.
+
+**What a consumer must be told:** an external allocator gets neither the
+generational protector nor the allocated-bit check, because both live in *our*
+block headers. A `heap_3` caller gets whatever the global allocator gives them.
+
+### 3b. `heap_3` — the original note
 
 106 lines of C, and all of them wrap `malloc`/`free` in a critical section.
 Kairos's version is the seam over `rusty_alloc` small-metal
