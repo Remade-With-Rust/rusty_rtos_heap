@@ -8,38 +8,64 @@
 
 The pure `no_std` core of
 [`rusty_rtos_heap`](https://crates.io/crates/rusty_rtos_heap): FreeRTOS's
-`heap_1` … `heap_5` as types and algorithms, with no CPU and no operating
-system. `#![forbid(unsafe_code)]`.
+`heap_4` as types and algorithms, with no CPU and no operating system.
+`#![forbid(unsafe_code)]`.
 
-**This crate is a scaffold**, and is published to reserve the name and pin the
-API shape rather than to be depended on for behaviour.
+- **`Heap4`**: address-ordered first fit, split only when the remainder is
+  strictly larger than twice the header, coalesce with the block before and
+  after — `heap_4.c`'s rules, transcribed over offsets rather than pointers.
+- **Proven against the C**: 20,000 operations agreeing on the offset first fit
+  chose, the free bytes remaining and the minimum ever free. **K4 passed
+  2026-09-10.**
 
-- **What exists**: the crate layout, the `no_std` / `alloc` / `std` feature
-  ladder, the lint policy and the shared CI gate.
-- **What does not**: the differential trace against the C `heap_4` — milestone
-  **K4**, and the first thing here with a kill test.
-
-**Known gaps.** Everything above the scaffold.
+**Known gaps.** `heap_1`, `heap_3` and `heap_5` are not written.
 
 ## Conformance
 
-**None yet, and that is the honest answer.** The Kairos rule is that a README
-makes no capability claim not backed by a test, a ledger entry or a recorded
-kill test. This section stays empty until K4's differential trace passes.
+Diffed against `heap_4.c` compiled **verbatim** from the pinned kernel, over
+**offsets** — a pointer is not comparable across two programs; an offset into a
+known aligned base is.
+
+**20,000 operations**, agreeing on the offset first fit chose, the free bytes
+remaining and the minimum ever free. The C arm is generated once and checked
+in, so the diff needs no C toolchain.
+
+```sh
+cargo test -p rusty_rtos_heap-core --release
+```
+
+It passed first time, and the first workload **never refused a request** — so
+what agreed was the easy half of an allocator. `the_workload_reaches_the_
+branches_that_matter` fails when that is true; the quoted agreement is on the
+harder workload it forced: 2,087 refusals, 784 distinct offsets,
+minimum-ever-free 1,232 of 8,192.
 
 ## Using it
 
-Not yet. The API is not stable and nothing behind it is proven.
+```rust
+use rusty_rtos_heap_core::Heap4;
+
+// The arena is a const generic; `alloc` answers with an OFFSET, not a pointer.
+let mut heap: Heap4<8192, 8, 8> = Heap4::new();
+let p = heap.alloc(64).expect("room for 64 bytes");
+heap.free(p);   // coalesces with its neighbours, as `heap_4.c` does
+```
 
 ## Performance
 
-No rows. Nothing here is measured.
+`total = arena + bookkeeping`, remainder **0**, bookkeeping a fixed **56
+bytes** that does not grow with the arena — and because a host test cannot
+measure a target, the same identity is a `const` assertion the compiler
+evaluates on all four bare-metal rungs.
+
+No cycle counts: nothing here has been timed on a part.
 
 ## Portability
 
-Builds `no_std` on host, `thumbv7m-none-eabi`,
-`riscv32imac-unknown-none-elf` and `xtensa-esp32s3-none-elf`, with and without
-`alloc`. A build claim, not a behaviour claim.
+`no_std` on host, `thumbv7m-none-eabi`, `riscv32imac-unknown-none-elf` and
+`xtensa-esp32s3-none-elf`. The RAM identity is asserted by the compiler on each
+of them, so it is a behaviour claim there and not only a build one. The header
+is 8 bytes on every Kairos target and 16 on the oracle's host.
 
 ## Part of Remade With Rust
 

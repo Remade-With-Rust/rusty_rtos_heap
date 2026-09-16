@@ -6,23 +6,24 @@
 [![docs.rs](https://docs.rs/rusty_rtos_heap/badge.svg)](https://docs.rs/rusty_rtos_heap)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-The **allocators** for Kairos — FreeRTOS's `heap_1` … `heap_5` remade in Rust.
-MIT OR Apache-2.0.
+The **allocators** for Kairos — FreeRTOS's `heap_4` remade in Rust, proven
+against the C by a differential over 20,000 operations. `#![forbid(unsafe_code)]`,
+`no_std`, MIT OR Apache-2.0.
 
-**This crate is a scaffold.** The layout, feature ladder, lint policy and CI
-gates exist; the allocators do not yet have a kill test behind them. It is
-published to reserve the name and to pin the API shape the rest of the family
-is written against, and the README says so rather than implying otherwise.
+- **Proven**: `heap_4`'s address-ordered first fit, splitting and coalescing,
+  diffed operation-for-operation against `heap_4.c` compiled verbatim from the
+  pinned kernel — agreeing on the offset chosen, the free bytes remaining and
+  the minimum ever free. **K4 passed 2026-09-10.**
+- **The RAM cost is an identity**: `total = arena + bookkeeping`, remainder 0,
+  bookkeeping a fixed 56 bytes — asserted by the compiler on all four
+  bare-metal targets, not just measured on the host.
 
-- **What exists**: the crate layout, the `no_std` / `alloc` / `std` feature
-  ladder, the workspace lint policy, `cargo deny`, and the CI gate that every
-  Kairos package shares.
-- **What does not**: the differential trace against the C `heap_4`, which is
-  milestone **K4** and is the first thing here with a kill test. No allocator
-  in this crate has been diffed against the oracle or run on a chip.
-
-**Known gaps.** Everything above the scaffold. Do not depend on this crate for
-behaviour yet; depend on it to pin the name and the shape.
+**Known gaps.** `heap_1` and `heap_5` are not written, and neither is
+`heap_3` (the seam over `rusty_alloc` small-metal and `esp-alloc`). This crate
+is `heap_4` and the RAM identity. Note also that the kernel does **not need**
+it: Kairos places every object in an arena declared at compile time, which is
+how the family reached a byte-identical corpus on four architectures with no
+heap at all.
 
 - This package's plan: [docs/plans/rusty_rtos_heap.md](https://github.com/Remade-With-Rust/rusty_rtos_heap/blob/main/docs/plans/rusty_rtos_heap.md)
 - Every number: [docs/LEDGER.md](https://github.com/Remade-With-Rust/rusty_rtos_heap/blob/main/docs/LEDGER.md)
@@ -35,37 +36,120 @@ flashed" means no chip has run it.
 
 ## Conformance
 
-**None yet, and that is the honest answer.** The Kairos rule is that a README
-makes no capability claim that is not backed by a test, a benchmark ledger
-entry or a kill test recorded in the plan — so this section stays empty until
-K4's differential trace passes.
+`heap_4.c`'s algorithm, transcribed over **offsets rather than pointers**, and
+diffed against `heap_4.c` compiled **verbatim** from the pinned kernel.
 
-What K4 will be: `heap_4`'s coalescing free list, diffed block-by-block against
-the C implementation over the same allocation sequence, the way the kernel is
-diffed against `tasks.c`.
+Offsets because a pointer is not comparable across two programs and an offset
+into a known aligned base is. The C driver sets
+`configAPPLICATION_ALLOCATED_HEAP` so `ucHeap` is its own aligned array, which
+is what makes the two arenas describable in the same coordinates.
 
-The kernel does not currently need this crate: it places every object in an
-arena declared at compile time, which is why the family could reach a byte-
-identical corpus on four architectures without a heap at all.
+| | |
+|---|---:|
+| operations diffed | **20,000** |
+| agreeing on the offset first fit chose | ✅ |
+| agreeing on free bytes remaining | ✅ |
+| agreeing on the minimum ever free | ✅ |
+
+```sh
+cargo test -p rusty_rtos_heap-core --release
+```
+
+The C arm is generated once and checked in, so the diff runs with **no C
+toolchain**.
+
+**What the first pass got wrong, and how it was caught.** It passed first time
+— and that was the problem. The original workload **never refused a single
+request**, so what agreed was the easy half of an allocator: the half that
+never has to say no. `the_workload_reaches_the_branches_that_matter` exists to
+fail when that is true, and the numbers above are from the harder workload it
+forced: **2,087 refusals, 784 distinct offsets, minimum-ever-free 1,232 of
+8,192**.
+
+**The RAM table is an identity, not a total.** `total = arena + bookkeeping`,
+remainder **0** on every row, with bookkeeping a fixed **56 bytes** that does
+not grow with the arena. Because a host test cannot measure a target, that same
+identity is a `const` assertion the compiler evaluates on all four bare-metal
+rungs — it cannot be true on the host and quietly false on the chip.
+
+Per profile means **per pointer width**: the block header is 8 bytes on every
+Kairos target and 16 on the oracle's host, and the minimum block size moves
+with it.
+
+**Still open:** `heap_1` and `heap_5` are not written. `heap_3` — the seam over
+`rusty_alloc` small-metal and `esp-alloc` — is not here either. This crate is
+`heap_4` and the RAM identity, and nothing else claims to exist.
 
 ## Using it
 
-Not yet. The API is not stable and nothing behind it is proven.
+```rust
+use rusty_rtos_heap_core::Heap4;
 
-Track [K4 in the mission plan](https://github.com/Remade-With-Rust/kairos/blob/main/docs/plans/rtos-mission.md)
-for the milestone that gives this crate a kill test.
+// The arena is a CONST GENERIC, not a borrowed slice: the geometry is declared
+// and the `.bss` cost is exactly what was asked for. `ALIGN` and `LINK` are the
+// port's alignment and the link-field width.
+const TOTAL: usize = 8192;
+const ALIGN: usize = 8;
+const LINK: usize = 8;
+
+let mut heap: Heap4<TOTAL, ALIGN, LINK> = Heap4::new();
+
+// `alloc` answers with an OFFSET into the arena, not a pointer -- which is the
+// same choice that made the differential against the C possible at all, since
+// a pointer is not comparable across two programs.
+let a = heap.alloc(64).expect("room for 64 bytes");
+let b = heap.alloc(128).expect("room for 128 bytes");
+
+// The three quantities the differential checks are the ones you can read back.
+let _free = heap.free_bytes();
+let _low_water = heap.minimum_ever_free_bytes();
+
+heap.free(a);
+heap.free(b);   // adjacent blocks coalesce, as `heap_4.c` does
+
+// Need a real address? Ask for one; the offset stays the currency.
+// let ptr = heap.address_of(a);
+```
+
+Address-ordered first fit; a block is split only when the remainder is strictly
+larger than twice the header; a freed block coalesces with the block before
+**and** the block after. Those are `heap_4.c`'s rules, and the differential is
+what proves they are followed rather than approximated.
 
 ## Performance
 
-No rows. Nothing here is measured, and an unmeasured allocator with a
-performance section would be exactly the claim this family's ledger discipline
-exists to prevent.
+One row, and it is an arithmetic identity rather than a timing:
+
+| | bytes |
+|---|---:|
+| arena | as declared |
+| bookkeeping | **56**, fixed — it does not grow with the arena |
+| **total** | **arena + 56**, remainder **0** on every row |
+
+`what_one_allocation_costs_is_the_cs_arithmetic` pins the per-allocation cost
+against the C's own arithmetic rather than against a measurement, because the
+cost of one allocation in `heap_4` IS arithmetic: the header, plus the rounding
+to the alignment.
+
+No cycle counts. Nothing in this crate has been timed on a part, and a
+`Performance` section quoting a number nobody measured is exactly what this
+family's ledger discipline exists to prevent.
 
 ## Portability
 
-Builds `no_std` on host, `thumbv7m-none-eabi`, `riscv32imac-unknown-none-elf`
-and `xtensa-esp32s3-none-elf`, with and without `alloc`. That is a build claim
-and not a behaviour claim.
+`no_std` everywhere, with `alloc` and `std` rungs above it. The RAM identity is
+a `const` assertion, so it is checked by the compiler on each of these rather
+than inferred from the host:
+
+| target | builds | RAM identity asserted |
+|---|---|---|
+| host (x86-64 Windows, Linux) | ✅ | ✅ |
+| `thumbv7m-none-eabi` | ✅ | ✅ |
+| `riscv32imac-unknown-none-elf` | ✅ | ✅ |
+| `xtensa-esp32s3-none-elf` | ✅ | ✅ |
+
+The header is 8 bytes on every Kairos target and 16 on the oracle's host, which
+is why "per profile" in the plan means per pointer width.
 
 ## Layout
 
@@ -98,7 +182,7 @@ directories under `firmware/`.
 This crate is part of **[Kairos](https://github.com/Remade-With-Rust/kairos)** —
 FreeRTOS remade in memory-safe Rust, as independent packages that expose the API
 a FreeRTOS developer already knows and prove every scheduling decision against
-the C kernel's own trace. `rusty_rtos_heap` is the allocator seam, and the one package in the family still at scaffold.
+the C kernel's own trace. `rusty_rtos_heap` is the allocator seam: `heap_4`, proven against the C by a differential.
 
 The family:
 [`rusty_rtos_core`](https://crates.io/crates/rusty_rtos_core) (the shared
