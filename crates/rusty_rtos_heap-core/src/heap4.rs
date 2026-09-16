@@ -421,6 +421,48 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         }
     }
 
+    // ---- the binding: offsets out, pointers in -------------------------
+
+    /// The address of an offset this heap returned.
+    ///
+    /// The allocator speaks offsets because an offset is comparable across
+    /// two programs and a pointer is not, which is what made the K4
+    /// differential against `heap_4.c` possible at all. A C ABI speaks
+    /// pointers. This is the one place the two meet, and it lives here
+    /// because `store` is private and should stay so — the module docs
+    /// call this "the binding" and put it in whatever owns the storage.
+    ///
+    /// Bounds-checked: an offset outside the arena answers `None` rather
+    /// than forming a pointer that is not in it.
+    pub fn address_of(&mut self, offset: u64) -> Option<core::ptr::NonNull<u8>> {
+        let index = usize::try_from(offset).ok()?;
+        if index >= N {
+            return None;
+        }
+        core::ptr::NonNull::new(self.store.as_mut_ptr().wrapping_add(index))
+    }
+
+    /// The inverse, for `free`: the offset of a pointer this heap handed
+    /// out, or `None` if it did not come from this arena.
+    ///
+    /// A pointer from somewhere else is the caller's bug, and answering
+    /// `None` makes it a refusal rather than a corrupted free list.
+    #[must_use]
+    pub fn offset_of(&self, pointer: *const u8) -> Option<u64> {
+        let base = self.store.as_ptr() as usize;
+        let address = pointer as usize;
+        if address < base || address >= base.saturating_add(N) {
+            return None;
+        }
+        // The guard above already proves `address >= base`, so this
+        // subtraction cannot wrap -- but a proof the compiler cannot see
+        // is not one the lint will accept, and `checked_sub` says the
+        // same thing in a form that survives a refactor of the guard.
+        address
+            .checked_sub(base)
+            .and_then(|offset| u64::try_from(offset).ok())
+    }
+
     // ---- the reporting the C exposes -----------------------------------
 
     /// `xPortGetFreeHeapSize`.
