@@ -51,7 +51,7 @@ could reasonably conclude the package is finished.
 | `heap_4` | **built and proven** — 20,000 operations diffed against `heap_4.c` |
 | `StaticAllocation` first-class | **met, and in a stronger form than the C's** — the C demo shows a system *can* be built with `configSUPPORT_DYNAMIC_ALLOCATION 0`; here it cannot be built any other way, gated on the linked rlib and poison-proven both directions |
 | RAM table per profile | **met** — an identity, remainder 0, `const`-asserted on four rungs |
-| `heap_1` | not written |
+| `heap_1` | **built and proven** -- 2,000 operations, 1,973 of them refusals |
 | `heap_5` | not written |
 | `heap_3` seam over `rusty_alloc` / `esp-alloc` | not written |
 | the protector | **needs a decision before it needs code** — see below |
@@ -71,7 +71,7 @@ request, so what agreed was the easy half of an allocator.
 every new differential below needs its own version of it. A differential whose
 workload cannot fail is a differential about nothing.
 
-### 1. `heap_1` — smallest, and worth doing first for that reason
+### 1. `heap_1` — BUILT 2026-09-16
 
 178 lines of C, and `vPortFree` is a no-op that asserts. Allocate-only, bump
 upward, never coalesce, never refuse except at exhaustion.
@@ -80,9 +80,33 @@ upward, never coalesce, never refuse except at exhaustion.
 * **Kill test:** the same differential harness, pointed at `heap_1.c`. The
   branch guard is inverted here — the workload must reach **exhaustion**,
   because refusal is the only interesting branch a bump allocator has.
-* **Why first:** it is a day's work and it proves the differential harness
-  generalises beyond the allocator it was written for. If the harness needs
-  changing to accept a second allocator, better to learn that on the easy one.
+* **Why first:** to learn whether the differential harness generalises beyond
+  the allocator it was written for.
+
+**It did, and the harness needed nothing.** `oracle/run-heap1.sh` compiles
+`heap_1.c` verbatim beside a second driver, the trace is checked in, and the
+Rust side diffs it the same way. 2,000 operations agree.
+
+**What it found before running a single operation.** The first driver freed
+every eighth allocation to show that freeing does nothing; the C arm exited 2
+with `configASSERT failed: pv == NULL`. `heap_1`'s `vPortFree` is not a no-op,
+it is an assertion that you did not call it -- "Force an assert as it is
+invalid to call this function". Our first draft answered `Ok(())`, which would
+have let a caller do silently what the C stops them doing loudly. It answers
+`Error::Unsupported` now, which is also the right answer for a caller generic
+over the heaps: choosing `heap_1` for a system that frees should fail at the
+first free rather than never.
+
+**The guard is inverted, and that is the transferable part.** heap_4's guard
+fails when the workload refuses too FEW requests, because its first version
+never refused any and agreed about the easy half of an allocator. A bump
+allocator's only interesting branch IS refusal, so heap_1's guard fails when
+the arena is never exhausted. Both say the same thing: a differential whose
+workload cannot fail is a differential about nothing.
+
+**Poison-proven**, which a first-time pass makes mandatory rather than
+optional: weakening the strictly-less-than bound to `>` diverges at operation
+42 -- ours accepts an allocation at offset 8,152 that the C refuses.
 
 ### 2. `heap_5` — `heap_4` over non-contiguous regions
 
@@ -191,7 +215,7 @@ widening the API to reach them.
 
 ### Order, and why
 
-`heap_1` → ~~protector decision~~ **(done 2026-09-16)** → `heap_5` → `heap_3`.
+~~`heap_1`~~ → ~~protector decision~~ **(both done 2026-09-16)** → `heap_5` → `heap_3`.
 
 `heap_1` first because it is small and it tests the harness. The protector
 decision next because `heap_5` would inherit the API. `heap_3` last because it

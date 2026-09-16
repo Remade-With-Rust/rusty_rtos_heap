@@ -14,6 +14,8 @@ against the C by a differential over 20,000 operations. `#![forbid(unsafe_code)]
   diffed operation-for-operation against `heap_4.c` compiled verbatim from the
   pinned kernel — agreeing on the offset chosen, the free bytes remaining and
   the minimum ever free. **K4 passed 2026-09-10.**
+- **`heap_1` too**, allocate-only, proven the same way -- with its guard
+  inverted, because refusal is the only branch a bump allocator has.
 - **The protector is the one the representation needs**, not the C's: a
   generational handle that refuses a double free, a stale free and an
   interior offset — the last of which `heap_4.c` does not catch.
@@ -21,7 +23,7 @@ against the C by a differential over 20,000 operations. `#![forbid(unsafe_code)]
   bookkeeping a fixed 56 bytes — asserted by the compiler on all four
   bare-metal targets, not just measured on the host.
 
-**Known gaps.** `heap_1` and `heap_5` are not written, and neither is
+**Known gaps.** `heap_5` is not written, and neither is
 `heap_3` (the seam over `rusty_alloc` small-metal and `esp-alloc`). This crate
 is `heap_4` and the RAM identity. Note also that the kernel does **not need**
 it: Kairos places every object in an arena declared at compile time, which is
@@ -122,7 +124,38 @@ with `heap_4.c` on the offset chosen, the free bytes remaining and the minimum
 ever free — and the differential now also asserts, 20,000 times, that the
 protector never refuses a legitimate free.
 
-**Still open:** `heap_1` and `heap_5` are not written. `heap_3` — the seam over
+### `heap_1`, and why its differential is not heap_4's
+
+`heap_1` is the allocate-only scheme: a bump index, no headers, no free list,
+and `vPortFree` is **invalid to call** rather than a no-op -- `heap_1.c`'s body
+is `configASSERT( pv == NULL )` under the comment "Force an assert as it is
+invalid to call this function."
+
+heap_4's workload exercises fragmentation, and none of those branches exist
+here. The only interesting branch a bump allocator has is **refusal**, so this
+workload runs the arena to exhaustion and keeps asking: **1,973 of 2,000
+operations are refused**, and all 2,000 agree with the C on the offset chosen
+and the free bytes remaining.
+
+That is heap_4's lesson applied rather than relearned. Its first workload never
+refused a request, so what agreed was the easy half of an allocator, and the
+guard there fails when refusals are too few. Here the guard is **inverted** --
+it fails if the arena is never exhausted. Same test, opposite direction: a
+differential whose workload cannot fail is a differential about nothing.
+
+**Poison-proven.** Weakening the bound from `>=` to `>` -- one character --
+diverges at operation 42: ours accepts an allocation at offset 8,152 that the C
+refuses. Three tests catch it.
+
+Three of the C's quirks are the specification here, and a reimplementation
+would get all three wrong: the alignment is applied to the **request** before
+the bump rather than to the resulting offset; the bound is **strictly** less
+than, so the last bytes can never be handed out; and the usable arena is
+`N - ALIGN`, because the C aligns its heap's start at run time and can lose up
+to `ALIGN - 1` bytes doing it. We lose none and subtract it anyway, because the
+size this allocator refuses on has to be the size the C refuses on.
+
+**Still open:** `heap_5` is not written. `heap_3` — the seam over
 `rusty_alloc` small-metal and `esp-alloc` — is not here either. This crate is
 `heap_4` and the RAM identity, and nothing else claims to exist.
 

@@ -16,8 +16,10 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+pub mod heap1;
 pub mod heap4;
 
+pub use heap1::Heap1;
 pub use heap4::Heap4;
 pub use rusty_rtos_core as rtos_core;
 

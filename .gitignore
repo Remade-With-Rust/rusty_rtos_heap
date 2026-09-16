@@ -12,3 +12,8 @@ bench/*/target
 bench/*/callgrind.out
 bench/*/heap4_driver
 oracle/heap4_driver
+
+# The differential drivers are BUILD OUTPUT: x86-64 ELF binaries that
+# `oracle/run.sh` and `oracle/run-heap1.sh` regenerate. The traces they
+# write are checked in (so CI needs no C toolchain); the executables are not.
+oracle/heap*_driver
