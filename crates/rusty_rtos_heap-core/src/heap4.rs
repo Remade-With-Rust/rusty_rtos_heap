@@ -628,13 +628,18 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         {
             return Err(Error::InvalidArgument);
         }
+        // One read serves both checks: the allocated bit is in the size
+        // word and the generation in the link word, and those are the two
+        // halves of one header.
+        let (stored, raw) = self.header_of(link);
         // The allocated bit FIRST: a free block's link word holds a next
-        // pointer, and reading that as a generation is how this check would
-        // fool itself.
-        if !self.is_allocated(link) {
+        // pointer, and TREATING that as a generation is how this check would
+        // fool itself. Having read it costs nothing; acting on it before the
+        // bit has passed is what would.
+        if (raw & ALLOCATED_BIT) == 0 {
             return Err(Error::Gone);
         }
-        if self.next_of(link) != u64::from(block.generation()) {
+        if stored != u64::from(block.generation()) {
             return Err(Error::Gone);
         }
         self.free_at(link);
