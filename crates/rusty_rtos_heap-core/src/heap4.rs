@@ -278,19 +278,26 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
     }
 
     /// `xStart.pxNextFreeBlock` or `pxIterator->pxNextFreeBlock`, with
-    /// `None` standing for the `xStart` sentinel that lives outside the
+    /// [`NONE`] standing for the `xStart` sentinel that lives outside the
     /// arena.
-    fn next_from(&self, iterator: Option<u64>) -> u64 {
-        match iterator {
-            None => self.start_next,
-            Some(offset) => self.next_of(offset),
+    ///
+    /// An offset rather than an `Option<u64>`: a `u64` has no niche, so the
+    /// option is two words and the walks that carry one wrote both of them
+    /// on every node they passed. `NONE` is already the arena's "nothing",
+    /// and it is `u64::MAX`, which no offset into a region of `N` reaches.
+    fn next_from(&self, iterator: u64) -> u64 {
+        if iterator == NONE {
+            self.start_next
+        } else {
+            self.next_of(iterator)
         }
     }
 
-    fn set_next_from(&mut self, iterator: Option<u64>, value: u64) {
-        match iterator {
-            None => self.start_next = value,
-            Some(offset) => self.set_next(offset, value),
+    fn set_next_from(&mut self, iterator: u64, value: u64) {
+        if iterator == NONE {
+            self.start_next = value;
+        } else {
+            self.set_next(iterator, value);
         }
     }
 
@@ -470,7 +477,7 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         }
 
         // Walk the address-ordered free list for the first block that fits.
-        let mut previous: Option<u64> = None;
+        let mut previous = NONE;
         let mut block = self.start_next;
         let after = loop {
             // One read serves both tests. The C reads the same two fields
@@ -481,7 +488,7 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
             if (raw & !ALLOCATED_BIT) >= size as u64 || next == NONE {
                 break next;
             }
-            previous = Some(block);
+            previous = block;
             block = next;
         };
         // Reaching `pxEnd` means nothing was large enough.
@@ -493,7 +500,7 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         // is the block the walk stopped on, and it is already in hand --
         // `next_from(previous)` would be a whole header read to re-derive a
         // register. The two agree by construction, including when the walk
-        // stopped on its first block and `previous` is still `None`, because
+        // stopped on its first block and `previous` is still `NONE`, because
         // `block` started at `start_next`.
         let chosen = block;
         let user = chosen.saturating_add(Self::STRUCT_SIZE as u64);
@@ -679,7 +686,7 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
 
         // Walk to the position, which is the address order the whole
         // design rests on. `next` is carried rather than re-read.
-        let mut iterator: Option<u64> = None;
+        let mut iterator = NONE;
         // The size of the node `iterator` names. The walk reads a whole
         // header to advance -- `next_of` is `header_of` with the size half
         // discarded -- and the node it read last is exactly the `previous`
@@ -687,7 +694,7 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         let mut previous_size = 0u64;
         let mut next = self.start_next;
         while next < insert {
-            iterator = Some(next);
+            iterator = next;
             let (link, raw) = self.header_of(next);
             previous_size = raw & !ALLOCATED_BIT;
             next = link;
@@ -697,14 +704,12 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         // `xStart` can never satisfy this: it is not in the arena, which
         // is why `iterator` is an `Option` rather than an offset.
         //
-        // `previous_size` is live exactly when `iterator` is `Some`: both
-        // are written by the same pass of the loop above.
-        if let Some(previous) = iterator {
-            if previous.saturating_add(previous_size) == insert {
-                insert_size = previous_size.saturating_add(insert_size);
-                self.set_raw_size(previous, insert_size);
-                insert = previous;
-            }
+        // `previous_size` is live exactly when `iterator` is not `NONE`:
+        // both are written by the same pass of the loop above.
+        if iterator != NONE && iterator.saturating_add(previous_size) == insert {
+            insert_size = previous_size.saturating_add(insert_size);
+            self.set_raw_size(iterator, insert_size);
+            insert = iterator;
         }
 
         // Coalesce with the block AFTER, unless that block is `pxEnd`,
@@ -727,7 +732,7 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
 
         // Only relink when the block did not merge into its predecessor;
         // if it did, the predecessor is already in the list.
-        if insert != iterator.unwrap_or(NONE) {
+        if insert != iterator {
             self.set_next_from(iterator, insert);
         }
     }
