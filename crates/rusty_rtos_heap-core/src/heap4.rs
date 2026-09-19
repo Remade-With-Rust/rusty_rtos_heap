@@ -687,10 +687,13 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
 
     /// The part of `vPortFree` after the checks, shared by both entry points.
     fn free_at(&mut self, link: u64) {
-        // `heapFREE_BLOCK`.
-        self.set_raw_size(link, self.raw_size_of(link) & !ALLOCATED_BIT);
-        self.free_bytes = self.free_bytes.saturating_add(self.size_of(link) as usize);
-        self.insert_into_free_list(link);
+        // `heapFREE_BLOCK`. The size with the allocated bit cleared is what
+        // gets written back, what the free total grows by, and what the
+        // insert starts its coalesce from -- one number, read once.
+        let size = self.size_of(link);
+        self.set_raw_size(link, size);
+        self.free_bytes = self.free_bytes.saturating_add(size as usize);
+        self.insert_into_free_list(link, size);
         self.frees = self.frees.saturating_add(1);
     }
 
@@ -706,9 +709,11 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
     /// header in a local instead is the same move as the walk in `alloc`,
     /// and the reason is the same: what it removes is not the load, it is
     /// everything wrapped around the load.
-    fn insert_into_free_list(&mut self, block: u64) {
+    fn insert_into_free_list(&mut self, block: u64, size: u64) {
         let mut insert = block;
-        let mut insert_size = self.size_of(insert);
+        // The caller has just read this -- it is the size it wrote back when
+        // it cleared the allocated bit.
+        let mut insert_size = size;
 
         // Walk to the position, which is the address order the whole
         // design rests on. `next` is carried rather than re-read.
