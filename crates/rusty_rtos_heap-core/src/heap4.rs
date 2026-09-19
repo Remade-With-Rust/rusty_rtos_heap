@@ -519,23 +519,27 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         let chosen = block;
         let user = chosen.saturating_add(Self::STRUCT_SIZE as u64);
 
-        // Unlink it.
-        self.set_next_from(previous, after);
-
         // Split only when the remainder is STRICTLY larger than the
         // minimum — an equal remainder is left attached, which is the line
         // that decides how fragmented the heap gets.
         let chosen_size = self.size_of(chosen);
         let remainder = chosen_size.saturating_sub(size as u64);
+        // Unlinking and splitting both write `previous`'s link, and the
+        // split's answer wins: done in sequence the first store was dead on
+        // every allocation that split, which is most of them. One link, one
+        // answer, one store.
         if remainder > Self::MINIMUM_BLOCK_SIZE as u64 {
             let new_block = chosen.saturating_add(size as u64);
-            // The remainder takes the chosen block's place in the list, so
-            // it gets both words at once. Its successor is `after`: the
-            // unlink above set `previous`'s link to exactly that, so reading
-            // it back would be a header read to recover a register.
+            // The remainder takes the chosen block's place in the list, so it
+            // gets both words at once. Its successor is `after`, which the
+            // walk broke with -- reading it back would be a header read to
+            // recover a register.
             self.set_header(new_block, after, remainder);
             self.set_raw_size(chosen, size as u64);
             self.set_next_from(previous, new_block);
+        } else {
+            // Nothing split off, so `previous` points past the chosen block.
+            self.set_next_from(previous, after);
         }
 
         // REFUTED, and kept as written for that reason. Folding these four
@@ -732,8 +736,8 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         }
 
         // Coalesce with the block BEFORE, if it ends exactly here.
-        // `xStart` can never satisfy this: it is not in the arena, which
-        // is why `iterator` is an `Option` rather than an offset.
+        // `xStart` can never satisfy this: it is not in the arena, which is
+        // why `iterator` reads `NONE` there rather than an offset.
         //
         // `previous_size` is live exactly when `iterator` is not `NONE`:
         // both are written by the same pass of the loop above.
