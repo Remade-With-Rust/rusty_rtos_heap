@@ -5,6 +5,7 @@
 //! change that moves it has to leave those 20,000 operations identical.
 
 use rusty_rtos_heap_core::Heap4;
+use rusty_rtos_heap_core::heap4::Block;
 
 const TOTAL: usize = 8192;
 const SLOTS: usize = 48;
@@ -22,7 +23,10 @@ impl Lcg {
 
 fn main() {
     let mut heap: Heap4<TOTAL, 8, 16> = Heap4::new();
-    let mut slots: [Option<u64>; SLOTS] = [None; SLOTS];
+    // Handles, not offsets: the differential gates the protector path, so a
+    // count taken over raw offsets would be a count of a function that does
+    // not ship.
+    let mut slots: [Option<Block>; SLOTS] = [None; SLOTS];
     let mut rng = Lcg(12345);
     let mut checksum = 0u64;
 
@@ -30,8 +34,8 @@ fn main() {
         let r = rng.next();
         let slot = (r as usize) % SLOTS;
         let held = slots.get(slot).copied().flatten();
-        if let Some(offset) = held {
-            let _ = heap.free(offset);
+        if let Some(block) = held {
+            let _ = heap.free(block);
             if let Some(cell) = slots.get_mut(slot) {
                 *cell = None;
             }
