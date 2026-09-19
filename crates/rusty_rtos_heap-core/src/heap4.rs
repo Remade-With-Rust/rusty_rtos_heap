@@ -578,7 +578,11 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         let generation = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1);
         self.set_next(chosen, u64::from(generation));
-        self.allocations = self.allocations.saturating_add(1);
+        // Wrapping, as `xNumberOfSuccessfulAllocations++` does: a `usize`
+        // counting allocations cannot reach its top, and saturating spent a
+        // conditional move on every one that happens to guard the one that
+        // does not.
+        self.allocations = self.allocations.wrapping_add(1);
         Some(Block {
             offset: u32::try_from(user).unwrap_or(u32::MAX),
             generation,
@@ -698,7 +702,8 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         self.set_raw_size(link, size);
         self.free_bytes = self.free_bytes.saturating_add(size as usize);
         self.insert_into_free_list(link, size);
-        self.frees = self.frees.saturating_add(1);
+        // Wrapping; see `alloc`.
+        self.frees = self.frees.wrapping_add(1);
     }
 
     /// `prvInsertBlockIntoFreeList`: address-ordered insert that coalesces
