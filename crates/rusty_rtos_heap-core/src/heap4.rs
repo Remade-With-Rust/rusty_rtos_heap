@@ -472,28 +472,33 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         // Walk the address-ordered free list for the first block that fits.
         let mut previous: Option<u64> = None;
         let mut block = self.start_next;
-        loop {
+        let after = loop {
             // One read serves both tests. The C reads the same two fields
-            // out of one cache line; so does this now.
+            // out of one cache line; so does this now -- and the `next` the
+            // walk stops on is the link the unlink below needs, so the loop
+            // hands it out rather than making the caller read it again.
             let (next, raw) = self.header_of(block);
             if (raw & !ALLOCATED_BIT) >= size as u64 || next == NONE {
-                break;
+                break next;
             }
             previous = Some(block);
             block = next;
-        }
+        };
         // Reaching `pxEnd` means nothing was large enough.
         if block == self.end {
             return None;
         }
 
-        // The C reads the returned block back out of `pxPreviousBlock`,
-        // which is the same block it just walked to.
-        let chosen = self.next_from(previous);
+        // The C reads the returned block back out of `pxPreviousBlock`. That
+        // is the block the walk stopped on, and it is already in hand --
+        // `next_from(previous)` would be a whole header read to re-derive a
+        // register. The two agree by construction, including when the walk
+        // stopped on its first block and `previous` is still `None`, because
+        // `block` started at `start_next`.
+        let chosen = block;
         let user = chosen.saturating_add(Self::STRUCT_SIZE as u64);
 
         // Unlink it.
-        let after = self.next_of(chosen);
         self.set_next_from(previous, after);
 
         // Split only when the remainder is STRICTLY larger than the
