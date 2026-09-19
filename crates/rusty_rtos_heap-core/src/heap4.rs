@@ -278,21 +278,13 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
     }
 
     /// `xStart.pxNextFreeBlock` or `pxIterator->pxNextFreeBlock`, with
-    /// [`NONE`] standing for the `xStart` sentinel that lives outside the
-    /// arena.
+    /// Set the link of `iterator`, with [`NONE`] standing for the `xStart`
+    /// sentinel that lives outside the arena.
     ///
     /// An offset rather than an `Option<u64>`: a `u64` has no niche, so the
     /// option is two words and the walks that carry one wrote both of them
     /// on every node they passed. `NONE` is already the arena's "nothing",
     /// and it is `u64::MAX`, which no offset into a region of `N` reaches.
-    fn next_from(&self, iterator: u64) -> u64 {
-        if iterator == NONE {
-            self.start_next
-        } else {
-            self.next_of(iterator)
-        }
-    }
-
     fn set_next_from(&mut self, iterator: u64, value: u64) {
         if iterator == NONE {
             self.start_next = value;
@@ -518,8 +510,10 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
             self.set_raw_size(new_block, remainder);
             self.set_raw_size(chosen, size as u64);
             // The remainder takes the chosen block's place in the list.
-            let previous_next = self.next_from(previous);
-            self.set_next(new_block, previous_next);
+            // Its successor is `after`: the unlink above set `previous`'s
+            // link to exactly that, so reading it back would be a header
+            // read to recover a value three lines up.
+            self.set_next(new_block, after);
             self.set_next_from(previous, new_block);
         }
 
