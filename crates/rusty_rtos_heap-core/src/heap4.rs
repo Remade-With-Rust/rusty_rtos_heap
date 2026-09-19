@@ -680,17 +680,26 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         // Walk to the position, which is the address order the whole
         // design rests on. `next` is carried rather than re-read.
         let mut iterator: Option<u64> = None;
+        // The size of the node `iterator` names. The walk reads a whole
+        // header to advance -- `next_of` is `header_of` with the size half
+        // discarded -- and the node it read last is exactly the `previous`
+        // the coalesce below wants a size for. So it keeps it.
+        let mut previous_size = 0u64;
         let mut next = self.start_next;
         while next < insert {
             iterator = Some(next);
-            next = self.next_of(next);
+            let (link, raw) = self.header_of(next);
+            previous_size = raw & !ALLOCATED_BIT;
+            next = link;
         }
 
         // Coalesce with the block BEFORE, if it ends exactly here.
         // `xStart` can never satisfy this: it is not in the arena, which
         // is why `iterator` is an `Option` rather than an offset.
+        //
+        // `previous_size` is live exactly when `iterator` is `Some`: both
+        // are written by the same pass of the loop above.
         if let Some(previous) = iterator {
-            let previous_size = self.size_of(previous);
             if previous.saturating_add(previous_size) == insert {
                 insert_size = previous_size.saturating_add(insert_size);
                 self.set_raw_size(previous, insert_size);
