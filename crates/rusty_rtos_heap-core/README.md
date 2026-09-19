@@ -15,8 +15,7 @@ The pure `no_std` core of
   strictly larger than twice the header, coalesce with the block before and
   after — `heap_4.c`'s rules, transcribed over offsets rather than pointers.
 - **Proven against the C**: 20,000 operations agreeing on the offset first fit
-  chose, the free bytes remaining and the minimum ever free. **K4 passed
-  2026-09-10.**
+  chose, the free bytes remaining and the minimum ever free.
 
 **Known gaps.** `heap_1`, `heap_3` and `heap_5` are not written.
 

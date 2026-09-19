@@ -6,14 +6,14 @@
 [![docs.rs](https://docs.rs/rusty_rtos_heap/badge.svg)](https://docs.rs/rusty_rtos_heap)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-The **allocators** for Kairos — FreeRTOS's `heap_4` remade in Rust, proven
-against the C by a differential over 20,000 operations. `#![forbid(unsafe_code)]`,
-`no_std`, MIT OR Apache-2.0.
+The allocators for Kairos. FreeRTOS's `heap_4` and `heap_5` remade in Rust,
+proven against the C by a differential over 20,000 operations: the offset
+chosen, the free bytes remaining and the minimum ever free.
 
 - **Proven**: `heap_4`'s address-ordered first fit, splitting and coalescing,
   diffed operation-for-operation against `heap_4.c` compiled verbatim from the
   pinned kernel — agreeing on the offset chosen, the free bytes remaining and
-  the minimum ever free. **K4 passed 2026-09-10.**
+  the minimum ever free.
 - **`heap_5` too**, the same free list laid out over several regions with
   real gaps — 20,000 operations, allocations landing in all three.
 - **`heap_1` too**, allocate-only, proven the same way -- with its guard
