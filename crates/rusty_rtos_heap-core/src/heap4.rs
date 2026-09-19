@@ -561,7 +561,10 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         // 2,709,563 -> 2,745,401, +35,838. The verdict is the same and now
         // it has been taken twice, on two different shapes.
         let taken = self.size_of(chosen);
-        self.free_bytes = self.free_bytes.saturating_sub(taken as usize);
+        // Wrapping: the chosen block came out of the free list, so its
+        // size is part of this total -- and `alloc` refused anything larger
+        // than the total before it started walking.
+        self.free_bytes = self.free_bytes.wrapping_sub(taken as usize);
         if self.free_bytes < self.minimum_ever_free {
             self.minimum_ever_free = self.free_bytes;
         }
@@ -700,7 +703,9 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         // insert starts its coalesce from -- one number, read once.
         let size = self.size_of(link);
         self.set_raw_size(link, size);
-        self.free_bytes = self.free_bytes.saturating_add(size as usize);
+        // Wrapping: this counts bytes of an arena of `N`, so it cannot
+        // pass the top of a `usize`.
+        self.free_bytes = self.free_bytes.wrapping_add(size as usize);
         self.insert_into_free_list(link, size);
         // Wrapping; see `alloc`.
         self.frees = self.frees.wrapping_add(1);
