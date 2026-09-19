@@ -230,6 +230,28 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         if word == 0 { next } else { size }
     }
 
+    /// Write both words of one header, in one bounds path.
+    ///
+    /// See [`Heap4::header_of`] for why this is worth a function of its own:
+    /// what it removes is not the store, it is the offset conversion, the
+    /// range and the chunk split that each single-word write repeats.
+    fn set_header(&mut self, offset: u64, next: u64, size: u64) {
+        let base = usize::try_from(offset).unwrap_or(usize::MAX);
+        let Some(header) = self
+            .store
+            .get_mut(base..)
+            .and_then(|rest| rest.first_chunk_mut::<{ 2 * size_of::<u64>() }>())
+        else {
+            return;
+        };
+        if let Some(slot) = header.first_chunk_mut::<{ size_of::<u64>() }>() {
+            *slot = next.to_ne_bytes();
+        }
+        if let Some(slot) = header.last_chunk_mut::<{ size_of::<u64>() }>() {
+            *slot = size.to_ne_bytes();
+        }
+    }
+
     fn write_word(&mut self, offset: u64, word: usize, value: u64) {
         let base = usize::try_from(offset).unwrap_or(usize::MAX);
         let Some(header) = self
@@ -507,13 +529,12 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         let remainder = chosen_size.saturating_sub(size as u64);
         if remainder > Self::MINIMUM_BLOCK_SIZE as u64 {
             let new_block = chosen.saturating_add(size as u64);
-            self.set_raw_size(new_block, remainder);
+            // The remainder takes the chosen block's place in the list, so
+            // it gets both words at once. Its successor is `after`: the
+            // unlink above set `previous`'s link to exactly that, so reading
+            // it back would be a header read to recover a register.
+            self.set_header(new_block, after, remainder);
             self.set_raw_size(chosen, size as u64);
-            // The remainder takes the chosen block's place in the list.
-            // Its successor is `after`: the unlink above set `previous`'s
-            // link to exactly that, so reading it back would be a header
-            // read to recover a value three lines up.
-            self.set_next(new_block, after);
             self.set_next_from(previous, new_block);
         }
 
@@ -529,6 +550,12 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         // per node and the branch is not; here the reads are once per call
         // and folding them introduced a merge the unconditional stores did
         // not need.
+        //
+        // RE-TESTED after the walk, the cursors and `set_header` had all
+        // moved the shape underneath it, and after `set_header` made the
+        // fold a one-liner rather than a restructure: still worse,
+        // 2,709,563 -> 2,745,401, +35,838. The verdict is the same and now
+        // it has been taken twice, on two different shapes.
         let taken = self.size_of(chosen);
         self.free_bytes = self.free_bytes.saturating_sub(taken as usize);
         if self.free_bytes < self.minimum_ever_free {
@@ -714,11 +741,11 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
                 self.set_next(insert, self.end);
             } else {
                 let (after, following_raw) = self.header_of(following);
-                self.set_raw_size(
+                self.set_header(
                     insert,
+                    after,
                     insert_size.saturating_add(following_raw & !ALLOCATED_BIT),
                 );
-                self.set_next(insert, after);
             }
         } else {
             self.set_next(insert, following);
