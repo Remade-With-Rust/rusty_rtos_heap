@@ -26,12 +26,14 @@ pub mod heap1;
 pub mod heap3;
 pub mod heap4;
 pub mod heap5;
+pub mod pool;
 
 pub use heap1::Heap1;
 #[cfg(feature = "alloc")]
 pub use heap3::Heap3;
 pub use heap4::{Heap4, Region};
 pub use heap5::Heap5;
+pub use pool::{Pool, Slot};
 pub use rusty_rtos_core as rtos_core;
 
 /// The names a firmware wants in scope.
