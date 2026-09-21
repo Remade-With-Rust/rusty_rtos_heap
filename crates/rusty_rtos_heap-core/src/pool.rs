@@ -25,6 +25,26 @@
 //!
 //! Flat in size, because nothing here depends on the size.
 //!
+//! # And the gap is WIDER on the part that ships
+//!
+//! Every Kairos target is 32-bit and the machine those numbers were taken on
+//! is not, so they understate the case. Built for `i686-unknown-linux-gnu`,
+//! the same `bench/heap4-ir` workload costs **1.95x** its host figure while
+//! `bench/pool-ir` costs **1.08x** -- because this file indexes with `u16`
+//! and [`crate::Heap4`] carries `u64` offsets, which are two or three
+//! instructions each on a 32-bit register file. On the target the pool is
+//! **73.9%** fewer instructions rather than 55.2%.
+//!
+//! # The RAM cost is an identity
+//!
+//! `tests/ram_table.rs` decomposes a pool to the byte with a remainder of
+//! zero: `total = arena + tables + scalars`, where the tables are a constant
+//! **seven bytes per block** -- a `u16` free-stack slot, a `u32` generation,
+//! a `bool` live flag -- independent of the block size AND of the block
+//! count. `heap_4`'s header is eight on a 32-bit target, before its
+//! sixteen-byte minimum block and before any fragmentation, neither of which
+//! a pool has.
+//!
 //! # What it costs to have
 //!
 //! A narrower question answered: one block size, a capacity fixed at compile

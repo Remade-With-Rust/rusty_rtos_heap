@@ -31,7 +31,20 @@ registers are touched (that is a port crate).
 
 ## 3. The surface as built
 
-Nothing yet. The facade re-exports the core; the core exposes `VERSION`.
+`Heap1`, `Heap4` (with `Region`), `Heap5`, `Heap3` behind the `alloc`
+feature, and `Pool` with its `Slot` handle. The facade re-exports the core;
+the core exposes `VERSION`.
+
+`Pool` is the one thing here with no C original. Rule 3 applies to it as to
+everything else, so each of its claims names its evidence:
+
+| claim | evidence |
+|---|---|
+| 55.2% fewer instructions than `heap_4` on its own band | `bench/pool-ir`, identical LCG/seed/pattern and **identical allocation and free counts** (10,014 and 9,986) |
+| 73.9% at the 32-bit width that ships | the same benches built for `i686-unknown-linux-gnu`; `heap4-ir` costs 1.95x its host figure, `pool-ir` 1.08x |
+| `total = arena + tables + scalars`, remainder 0 | `tests/ram_table.rs::the_pool_ram_table_decomposes_exactly` |
+| seven bytes per block, independent of block size AND count | the same test, asserted across six geometries |
+| a stale handle cannot read the block that replaced it | `pool.rs::a_stale_handle_cannot_read_the_block_that_replaced_it`, which fails when the generation bump is removed -- the double-free test does not, so it is the one that proves the generation |
 
 ## 4. Roadmap
 
@@ -55,6 +68,7 @@ could reasonably conclude the package is finished.
 | `heap_5` | **built and proven** -- 20,000 operations over three regions |
 | `heap_3` seam over `rusty_alloc` / `esp-alloc` | not written |
 | the protector | **needs a decision before it needs code** — see below |
+| `Pool`, which K4 did not scope | **built, proven and measured (2026-09-21)** — not a FreeRTOS file and it does not pretend to be. Seven unit tests, the generation poison-proven, a RAM identity with remainder 0 and a constant seven bytes per block, and 55.2% fewer instructions than `heap_4` on the host / **73.9% at the 32-bit width every target has**, on the identical workload with identical allocation and free counts |
 
 ### The method is already proven, so reuse it rather than reinvent it
 

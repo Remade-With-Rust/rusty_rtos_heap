@@ -29,6 +29,7 @@
 use core::mem::{align_of, size_of};
 
 use rusty_rtos_heap_core::Heap4;
+use rusty_rtos_heap_core::pool::Pool;
 
 /// One row: a geometry, an arena size, and what it costs.
 struct Row {
@@ -185,4 +186,136 @@ fn what_one_allocation_costs_is_the_cs_arithmetic() {
     assert_eq!(smallest, 24, "a 1-byte request costs 24 bytes at 64-bit");
     println!();
     println!("a 1-byte request costs {smallest} bytes: {header} header + padding.");
+}
+
+/// One pool geometry, decomposed to the byte.
+struct PoolRow {
+    block: usize,
+    blocks: usize,
+    arena: usize,
+    total: usize,
+    align: usize,
+}
+
+impl PoolRow {
+    /// The free stack, the generations and the live flags: two bytes, four
+    /// bytes and one byte per block.
+    const fn tables(&self) -> usize {
+        self.blocks.saturating_mul(2 + 4 + 1)
+    }
+
+    /// `top`, `allocations`, `frees`.
+    fn scalars() -> usize {
+        size_of::<usize>()
+            .saturating_add(size_of::<u32>())
+            .saturating_add(size_of::<u32>())
+    }
+
+    /// What the struct carries that no column above names.
+    fn padding(&self) -> usize {
+        self.total
+            .saturating_sub(self.arena)
+            .saturating_sub(self.tables())
+            .saturating_sub(Self::scalars())
+    }
+
+    /// The whole cost of having a block, over and above the block.
+    fn per_block(&self) -> f64 {
+        #[allow(clippy::cast_precision_loss)]
+        let (book, blocks) = (
+            self.total.saturating_sub(self.arena) as f64,
+            self.blocks.max(1) as f64,
+        );
+        book / blocks
+    }
+}
+
+macro_rules! pool_row {
+    ($block:literal, $blocks:literal) => {
+        PoolRow {
+            block: $block,
+            blocks: $blocks,
+            arena: Pool::<$block, $blocks>::BYTES,
+            total: size_of::<Pool<$block, $blocks>>(),
+            align: align_of::<Pool<$block, $blocks>>(),
+        }
+    };
+}
+
+/// What a [`Pool`] costs, decomposed, and the property that makes it worth
+/// having.
+///
+/// `heap_4`'s per-block cost is its header — eight bytes on a 32-bit target
+/// — PLUS whatever its `MINIMUM_BLOCK_SIZE` of sixteen strands, PLUS
+/// fragmentation, which no table can predict because it depends on the order
+/// the application allocates in. A pool has a header of nothing, strands
+/// nothing, and cannot fragment: its cost is three side tables, and this
+/// asserts that cost is **constant per block and independent of the block
+/// size**, which is the whole claim.
+#[test]
+fn the_pool_ram_table_decomposes_exactly() {
+    let rows = [
+        pool_row!(64, 48),
+        pool_row!(256, 48),
+        pool_row!(512, 48),
+        pool_row!(2048, 48),
+        pool_row!(512, 8),
+        pool_row!(512, 256),
+    ];
+
+    println!();
+    println!("=== what a Pool costs, per geometry ===");
+    println!();
+    println!(
+        "{:>6} {:>7} {:>9} {:>9} {:>6} {:>8} {:>8} {:>10}",
+        "block", "blocks", "arena", "total B", "align", "tables", "padding", "per block"
+    );
+
+    let mut per_block = None;
+    for r in &rows {
+        println!(
+            "{:>6} {:>7} {:>9} {:>9} {:>6} {:>8} {:>8} {:>10.2}",
+            r.block,
+            r.blocks,
+            r.arena,
+            r.total,
+            r.align,
+            r.tables(),
+            r.padding(),
+            r.per_block()
+        );
+
+        // The identity: arena + tables + scalars is the whole struct.
+        assert_eq!(
+            r.padding(),
+            0,
+            "Pool<{}, {}>: {} bytes belong to no column",
+            r.block,
+            r.blocks,
+            r.padding()
+        );
+
+        // The claim. A cost that moved with the BLOCK size would be a
+        // per-byte tax hiding in the bookkeeping.
+        let cost = r
+            .total
+            .saturating_sub(r.arena)
+            .saturating_sub(PoolRow::scalars());
+        let each = cost.checked_div(r.blocks).expect("a pool has blocks");
+        assert_eq!(each, 7, "Pool<{}, {}>: per-block tables", r.block, r.blocks);
+        match per_block {
+            None => per_block = Some(each),
+            Some(first) => assert_eq!(
+                each, first,
+                "the per-block cost moved with the geometry; it is supposed to be a constant"
+            ),
+        }
+    }
+
+    println!();
+    println!("  seven bytes per block: a u16 free-stack slot, a u32 generation,");
+    println!("  a bool live flag. Against heap_4's eight-byte header on a 32-bit");
+    println!("  target -- before its 16-byte minimum block and before any");
+    println!("  fragmentation, neither of which a pool has.");
+    println!();
 }

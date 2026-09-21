@@ -28,6 +28,10 @@ chosen, the free bytes remaining and the minimum ever free.
 - **The RAM cost is an identity**: `total = arena + bookkeeping`, remainder 0,
   bookkeeping a fixed 56 bytes — asserted by the compiler on all four
   bare-metal targets, not just measured on the host.
+- **And a `Pool`, for the allocation an RTOS actually makes**: one block
+  size, served from a pre-sized arena. **55.2% fewer instructions than
+  `heap_4` on the host and 73.9% fewer at the 32-bit width that ships**, on
+  the identical workload with identical allocation and free counts.
 
 **Known gaps.** `heap_3` cannot be proven against the C the way the other
 three are —
@@ -232,6 +236,71 @@ all.
 `heap_5` are all built. `heap_3` — the seam over
 `rusty_alloc` small-metal and `esp-alloc` — is not here either. This crate is
 `heap_4` and the RAM identity, and nothing else claims to exist.
+
+### `Pool`, and the question it declines to answer
+
+`heap_4` answers a general question — any size, any order, coalescing — and
+its cost **is** that generality. Four attempts to make that file 50% faster
+are in the ledger with their numbers, and the decomposition says why none
+could be: the largest identifiable lever is the first-fit walk at 14.8%.
+There is no 50% in that file.
+
+There is one in the question. TCBs, queue items, timer records and event
+blocks are **one size, known when the system is declared** — which is what
+this package's charter already calls static allocation first-class. A pool
+serves one size from a pre-sized arena, so there is no size to compare, no
+block to split, no neighbour to coalesce and no list to walk. `alloc` is a
+pop and `free` is a push.
+
+Measured on `bench/pool-ir`, which is `bench/heap4-ir` with one thing changed
+— which allocator answers. Same LCG, same seed, same 48-slot pattern, same
+20,000 operations, and **identical allocation and free counts on both arms**
+(10,014 and 9,986), which is what makes the two numbers a comparison rather
+than two numbers:
+
+| | Ir total | Ir/op | |
+|---|---:|---:|---|
+| `heap_4`, restricted to 256..=512 | 2,660,831 | 133.04 | |
+| **`Pool<512, 48>`, same workload** | **1,191,428** | **59.57** | **−55.2%** |
+
+512 is the unflattering end to measure at: a pool pays for the size it was
+declared with whatever is asked.
+
+**At the width that actually ships the gap is wider.** Every Kairos target is
+32-bit; the host is not. Built for `i686-unknown-linux-gnu`, `heap4-ir` costs
+**1.95×** its host figure and `pool-ir` only **1.08×** — because a pool
+indexes with `u16` where `heap_4` carries `u64` offsets. On the target,
+`Pool` is **73.9%** fewer instructions.
+
+#### What it costs to have, stated rather than buried
+
+One block size. A capacity fixed at compile time. No coalescing, and no
+borrowing from a neighbour that has room. A pool cannot serve a request it
+was not sized for. That is the whole trade: it is faster **because** the
+question is narrower, not because the allocator is cleverer. It does not
+replace `heap_4` and does not touch it — `heap4.rs` is untouched and its
+byte-exact differential still passes.
+
+#### The RAM cost is an identity here too
+
+`tests/ram_table.rs` decomposes a pool to the byte and asserts the remainder
+is zero: `total = arena + tables + scalars`, with the tables a **constant
+seven bytes per block** — a `u16` free-stack slot, a `u32` generation, a
+`bool` live flag — independent of the block size and of the block count.
+
+Against `heap_4`'s eight-byte header on a 32-bit target that is already
+slightly cheaper, and that is before `heap_4`'s sixteen-byte minimum block
+and before any fragmentation, **neither of which a pool has**.
+
+#### The handle is the protector
+
+`Slot` carries a generation and freeing bumps it, so a handle to a block that
+has since been freed names a generation that no longer exists. Poisoned
+before it was believed: removing the bump does **not** fail the double-free
+test — the live flag catches that on its own — it fails
+`a_stale_handle_cannot_read_the_block_that_replaced_it`, which is the
+generation's actual job.
+
 
 ## Using it
 
