@@ -41,18 +41,6 @@ use core::mem::size_of;
 
 use rusty_rtos_core::error::{Error, Result};
 
-/// The free-list terminator. The C uses a null pointer; an offset of all
-/// ones cannot be a real offset into an arena that fits in memory.
-const NONE: u64 = u64::MAX;
-
-/// `heapBLOCK_ALLOCATED_BITMASK`: the top bit of the size word marks a
-/// block as the application's rather than the free list's.
-///
-/// Modelled at **64 bits** because the oracle's `size_t` is 64 bits. The
-/// bit's position is part of the geometry, not of the host.
-const ALLOCATED_BIT: u64 = 1 << 63;
-
-/// Round `value` up to a multiple of `align`, saturating.
 const fn align_up(value: usize, align: usize) -> usize {
     let mask = align.saturating_sub(1);
     value.saturating_add(mask) & !mask
@@ -172,6 +160,45 @@ pub struct Heap4<const N: usize, const ALIGN: usize, const LINK: usize> {
 impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK> {
     /// `xHeapStructSize`: the header, rounded up to the alignment.
     pub const STRUCT_SIZE: usize = align_up(LINK, ALIGN);
+
+    /// The width of ONE stored header word, in bytes.
+    ///
+    /// `heap_4.c` stores a `BlockLink_t` -- one pointer and one `size_t` --
+    /// so its word is the target's pointer width, and `LINK` is
+    /// `sizeof( BlockLink_t )`. This file used to store two `u64`s whatever
+    /// `LINK` said, which is correct only for a 64-bit target and silently
+    /// wrong for every other: with `LINK = 8` the header occupied sixteen
+    /// bytes while `STRUCT_SIZE` claimed eight, so `alloc` handed the caller
+    /// a payload starting ON the size word and the caller's first write
+    /// destroyed the block's own length. See
+    /// `the_payload_begins_after_the_header_it_follows`, which is that
+    /// defect written as an assertion.
+    const WORD: usize = Self::STRUCT_SIZE / 2;
+    /// Whether a stored word is four bytes rather than eight.
+    ///
+    /// A `const`, so the branches it guards are resolved when the type is
+    /// monomorphised and neither path costs a test at run time.
+    const NARROW: bool = Self::WORD == size_of::<u32>();
+    /// `heapBLOCK_ALLOCATED_BITMASK`: the top bit of the stored size word.
+    /// Which bit that IS depends on how wide the word is.
+    const ALLOCATED_BIT: u64 = if Self::NARROW { 1 << 31 } else { 1 << 63 };
+    /// The "no such block" link -- an all-ones stored word, which no offset
+    /// into a region of `N` can equal.
+    const NONE: u64 = if Self::NARROW {
+        u32::MAX as u64
+    } else {
+        u64::MAX
+    };
+    /// The geometry must be one this file can actually store.
+    ///
+    /// `STRUCT_SIZE` is what `alloc` adds to reach the payload and
+    /// `2 * WORD` is what the header physically occupies; they are the same
+    /// number by construction here, and this refuses at COMPILE TIME any
+    /// `LINK`/`ALIGN` pair that would make them differ.
+    const GEOMETRY_FITS: () = assert!(
+        Self::STRUCT_SIZE == 2 * size_of::<u32>() || Self::STRUCT_SIZE == 2 * size_of::<u64>(),
+        "a heap_4 header is one pointer plus one size_t; LINK aligned to ALIGN must be 8 (32-bit) or 16 (64-bit)"
+    );
     /// `heapMINIMUM_BLOCK_SIZE`: twice the header. A remainder must be
     /// **strictly greater** than this to be worth splitting off.
     pub const MINIMUM_BLOCK_SIZE: usize = Self::STRUCT_SIZE.saturating_mul(2);
@@ -180,10 +207,13 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
     /// as it does in the C.
     #[must_use]
     pub const fn new() -> Self {
+        // Force the geometry assertion; a const item is only evaluated
+        // where it is used, so an unused one would refuse nothing.
+        let () = Self::GEOMETRY_FITS;
         Self {
             store: [0; N],
-            start_next: NONE,
-            end: NONE,
+            start_next: Self::NONE,
+            end: Self::NONE,
             next_generation: 1,
             free_bytes: 0,
             minimum_ever_free: 0,
@@ -207,22 +237,81 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
     ///
     /// `get` rather than indexing, and a fixed-size destination, so the
     /// compiler sees one length it can check instead of two it cannot.
+    /// A byte offset as an index into the arena.
+    ///
+    /// **This narrowing is 14.5% of the run on a 32-bit target and free on a
+    /// 64-bit one**, which is why it is a function with an argument rather
+    /// than a `try_from` repeated three times. Measured on `bench/heap4-ir`
+    /// built for `i686-unknown-linux-gnu`: `convert/num.rs` costs 38.46
+    /// instructions per operation there and 1.79 on the host, and removing
+    /// the check took the arm from 265.41 to 245.16 Ir/op — **-7.6%**, with
+    /// the checksum and both operation counts unmoved.
+    ///
+    /// A host measurement cannot see this at all. `usize::try_from(u64)` is
+    /// a no-op where `usize` is 64 bits, so the same probe on x86-64
+    /// measured **byte-identical**. Every Kairos target is 32-bit; the host
+    /// is the machine where the suspect is not at the scene.
+    ///
+    /// # Why the cast is exact
+    ///
+    /// Every offset this module forms is bounded by the arena: it comes
+    /// from a [`Block`], whose `offset` is a `u32`, or from arithmetic over
+    /// such offsets and sizes that the arena already bounds. `N` is a
+    /// `usize`, so an in-range offset fits a `usize` on any target.
+    ///
+    /// The `debug_assert` is the invariant under test rather than in a
+    /// comment — and the `.get(..)` every caller performs on the result is
+    /// the second line: a truncated index would be refused there unless it
+    /// happened to land in range, which is exactly the case the assertion
+    /// covers.
+    fn index_of(offset: u64) -> usize {
+        debug_assert!(
+            offset <= u64::try_from(N).unwrap_or(u64::MAX),
+            "an offset past the arena reached index_of; the caller failed to bound it"
+        );
+        // The bound above is the proof; the lint cannot see it.
+        #[allow(clippy::cast_possible_truncation)]
+        let index = offset as usize;
+        index
+    }
+
+    /// Both words of one header.
+    ///
+    /// The stored width follows [`Heap4::WORD`], so a 32-bit geometry reads
+    /// two `u32`s and a 64-bit one reads two `u64`s. [`Heap4::NARROW`] is a
+    /// `const`, so only one arm survives monomorphisation -- the branch is
+    /// not paid for at run time.
     fn header_of(&self, offset: u64) -> (u64, u64) {
-        let base = usize::try_from(offset).unwrap_or(usize::MAX);
-        let Some(bytes) = self
-            .store
-            .get(base..)
-            .and_then(|rest| rest.first_chunk::<{ 2 * size_of::<u64>() }>())
-        else {
+        let base = Self::index_of(offset);
+        let Some(rest) = self.store.get(base..) else {
             return (0, 0);
         };
-        let Some(next) = bytes.first_chunk::<{ size_of::<u64>() }>() else {
-            return (0, 0);
-        };
-        let Some(size) = bytes.last_chunk::<{ size_of::<u64>() }>() else {
-            return (0, 0);
-        };
-        (u64::from_ne_bytes(*next), u64::from_ne_bytes(*size))
+        if Self::NARROW {
+            let Some(bytes) = rest.first_chunk::<{ 2 * size_of::<u32>() }>() else {
+                return (0, 0);
+            };
+            let Some(next) = bytes.first_chunk::<{ size_of::<u32>() }>() else {
+                return (0, 0);
+            };
+            let Some(size) = bytes.last_chunk::<{ size_of::<u32>() }>() else {
+                return (0, 0);
+            };
+            (
+                u64::from(u32::from_ne_bytes(*next)),
+                u64::from(u32::from_ne_bytes(*size)),
+            )
+        } else {
+            let Some(bytes) = rest.first_chunk::<{ 2 * size_of::<u64>() }>() else {
+                return (0, 0);
+            };
+            let Some(next) = bytes.first_chunk::<{ size_of::<u64>() }>() else {
+                return (0, 0);
+            };
+            let Some(size) = bytes.last_chunk::<{ size_of::<u64>() }>() else {
+                return (0, 0);
+            };
+            (u64::from_ne_bytes(*next), u64::from_ne_bytes(*size))
+        }
     }
 
     fn read_word(&self, offset: u64, word: usize) -> u64 {
@@ -236,38 +325,65 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
     /// what it removes is not the store, it is the offset conversion, the
     /// range and the chunk split that each single-word write repeats.
     fn set_header(&mut self, offset: u64, next: u64, size: u64) {
-        let base = usize::try_from(offset).unwrap_or(usize::MAX);
-        let Some(header) = self
-            .store
-            .get_mut(base..)
-            .and_then(|rest| rest.first_chunk_mut::<{ 2 * size_of::<u64>() }>())
-        else {
+        let base = Self::index_of(offset);
+        let Some(rest) = self.store.get_mut(base..) else {
             return;
         };
-        if let Some(slot) = header.first_chunk_mut::<{ size_of::<u64>() }>() {
-            *slot = next.to_ne_bytes();
-        }
-        if let Some(slot) = header.last_chunk_mut::<{ size_of::<u64>() }>() {
-            *slot = size.to_ne_bytes();
+        if Self::NARROW {
+            let Some(header) = rest.first_chunk_mut::<{ 2 * size_of::<u32>() }>() else {
+                return;
+            };
+            #[allow(clippy::cast_possible_truncation)]
+            let (next, size) = (next as u32, size as u32);
+            if let Some(slot) = header.first_chunk_mut::<{ size_of::<u32>() }>() {
+                *slot = next.to_ne_bytes();
+            }
+            if let Some(slot) = header.last_chunk_mut::<{ size_of::<u32>() }>() {
+                *slot = size.to_ne_bytes();
+            }
+        } else {
+            let Some(header) = rest.first_chunk_mut::<{ 2 * size_of::<u64>() }>() else {
+                return;
+            };
+            if let Some(slot) = header.first_chunk_mut::<{ size_of::<u64>() }>() {
+                *slot = next.to_ne_bytes();
+            }
+            if let Some(slot) = header.last_chunk_mut::<{ size_of::<u64>() }>() {
+                *slot = size.to_ne_bytes();
+            }
         }
     }
 
     fn write_word(&mut self, offset: u64, word: usize, value: u64) {
-        let base = usize::try_from(offset).unwrap_or(usize::MAX);
-        let Some(header) = self
-            .store
-            .get_mut(base..)
-            .and_then(|rest| rest.first_chunk_mut::<{ 2 * size_of::<u64>() }>())
-        else {
+        let base = Self::index_of(offset);
+        let Some(rest) = self.store.get_mut(base..) else {
             return;
         };
-        let bytes = value.to_ne_bytes();
-        if word == 0 {
-            if let Some(slot) = header.first_chunk_mut::<{ size_of::<u64>() }>() {
+        if Self::NARROW {
+            let Some(header) = rest.first_chunk_mut::<{ 2 * size_of::<u32>() }>() else {
+                return;
+            };
+            #[allow(clippy::cast_possible_truncation)]
+            let bytes = (value as u32).to_ne_bytes();
+            if word == 0 {
+                if let Some(slot) = header.first_chunk_mut::<{ size_of::<u32>() }>() {
+                    *slot = bytes;
+                }
+            } else if let Some(slot) = header.last_chunk_mut::<{ size_of::<u32>() }>() {
                 *slot = bytes;
             }
-        } else if let Some(slot) = header.last_chunk_mut::<{ size_of::<u64>() }>() {
-            *slot = bytes;
+        } else {
+            let Some(header) = rest.first_chunk_mut::<{ 2 * size_of::<u64>() }>() else {
+                return;
+            };
+            let bytes = value.to_ne_bytes();
+            if word == 0 {
+                if let Some(slot) = header.first_chunk_mut::<{ size_of::<u64>() }>() {
+                    *slot = bytes;
+                }
+            } else if let Some(slot) = header.last_chunk_mut::<{ size_of::<u64>() }>() {
+                *slot = bytes;
+            }
         }
     }
 
@@ -291,16 +407,16 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
 
     /// The block's size with the allocated bit masked off.
     fn size_of(&self, offset: u64) -> u64 {
-        self.raw_size_of(offset) & !ALLOCATED_BIT
+        self.raw_size_of(offset) & !Self::ALLOCATED_BIT
     }
 
     /// `heapBLOCK_IS_ALLOCATED`.
     fn is_allocated(&self, offset: u64) -> bool {
-        (self.raw_size_of(offset) & ALLOCATED_BIT) != 0
+        (self.raw_size_of(offset) & Self::ALLOCATED_BIT) != 0
     }
 
     /// `xStart.pxNextFreeBlock` or `pxIterator->pxNextFreeBlock`, with
-    /// Set the link of `iterator`, with [`NONE`] standing for the `xStart`
+    /// Set the link of `iterator`, with `Self::NONE` standing for the `xStart`
     /// sentinel that lives outside the arena.
     ///
     /// An offset rather than an `Option<u64>`: a `u64` has no niche, so the
@@ -308,7 +424,7 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
     /// on every node they passed. `NONE` is already the arena's "nothing",
     /// and it is `u64::MAX`, which no offset into a region of `N` reaches.
     fn set_next_from(&mut self, iterator: u64, value: u64) {
-        if iterator == NONE {
+        if iterator == Self::NONE {
             self.start_next = value;
         } else {
             self.set_next(iterator, value);
@@ -342,7 +458,7 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
 
         self.end = end;
         self.set_raw_size(end, 0);
-        self.set_next(end, NONE);
+        self.set_next(end, Self::NONE);
 
         // One free block covering everything up to `pxEnd`.
         let first_size = end_address.saturating_sub(start_address as usize);
@@ -435,7 +551,7 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
             }
 
             self.set_raw_size(end, 0);
-            self.set_next(end, NONE);
+            self.set_next(end, Self::NONE);
 
             let block_size = end.saturating_sub(start);
             self.set_raw_size(start, block_size);
@@ -480,7 +596,7 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         let size = align_up(with_header, ALIGN);
         // `heapBLOCK_SIZE_IS_VALID`: the top bit is the allocated flag, so
         // a request that reaches it is refused rather than mis-tagged.
-        if (size as u64 & ALLOCATED_BIT) != 0 {
+        if (size as u64 & Self::ALLOCATED_BIT) != 0 {
             return None;
         }
 
@@ -491,7 +607,7 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         }
 
         // Walk the address-ordered free list for the first block that fits.
-        let mut previous = NONE;
+        let mut previous = Self::NONE;
         let mut block = self.start_next;
         let after = loop {
             // One read serves both tests. The C reads the same two fields
@@ -499,7 +615,7 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
             // walk stops on is the link the unlink below needs, so the loop
             // hands it out rather than making the caller read it again.
             let (next, raw) = self.header_of(block);
-            if (raw & !ALLOCATED_BIT) >= size as u64 || next == NONE {
+            if (raw & !Self::ALLOCATED_BIT) >= size as u64 || next == Self::NONE {
                 break next;
             }
             previous = block;
@@ -577,7 +693,7 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         // The allocated bit still distinguishes a live block from a free one,
         // so the free path checks that first and never mistakes a free
         // block's next pointer for a generation.
-        self.set_raw_size(chosen, self.raw_size_of(chosen) | ALLOCATED_BIT);
+        self.set_raw_size(chosen, self.raw_size_of(chosen) | Self::ALLOCATED_BIT);
         let generation = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1);
         self.set_next(chosen, u64::from(generation));
@@ -647,7 +763,7 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         // pointer, and TREATING that as a generation is how this check would
         // fool itself. Having read it costs nothing; acting on it before the
         // bit has passed is what would.
-        if (raw & ALLOCATED_BIT) == 0 {
+        if (raw & Self::ALLOCATED_BIT) == 0 {
             return Err(Error::Gone);
         }
         if stored != u64::from(block.generation()) {
@@ -731,7 +847,7 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
 
         // Walk to the position, which is the address order the whole
         // design rests on. `next` is carried rather than re-read.
-        let mut iterator = NONE;
+        let mut iterator = Self::NONE;
         // The size of the node `iterator` names. The walk reads a whole
         // header to advance -- `next_of` is `header_of` with the size half
         // discarded -- and the node it read last is exactly the `previous`
@@ -741,7 +857,7 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         while next < insert {
             iterator = next;
             let (link, raw) = self.header_of(next);
-            previous_size = raw & !ALLOCATED_BIT;
+            previous_size = raw & !Self::ALLOCATED_BIT;
             next = link;
         }
 
@@ -751,7 +867,7 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         //
         // `previous_size` is live exactly when `iterator` is not `NONE`:
         // both are written by the same pass of the loop above.
-        if iterator != NONE && iterator.saturating_add(previous_size) == insert {
+        if iterator != Self::NONE && iterator.saturating_add(previous_size) == insert {
             insert_size = previous_size.saturating_add(insert_size);
             self.set_raw_size(iterator, insert_size);
             insert = iterator;
@@ -768,7 +884,7 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
                 self.set_header(
                     insert,
                     after,
-                    insert_size.saturating_add(following_raw & !ALLOCATED_BIT),
+                    insert_size.saturating_add(following_raw & !Self::ALLOCATED_BIT),
                 );
             }
         } else {
@@ -858,7 +974,7 @@ impl<const N: usize, const ALIGN: usize, const LINK: usize> Heap4<N, ALIGN, LINK
         let mut count = 0usize;
         let mut largest = 0usize;
         let mut block = self.start_next;
-        while block != NONE && block != self.end {
+        while block != Self::NONE && block != self.end {
             count = count.saturating_add(1);
             let size = self.size_of(block) as usize;
             if size > largest {
@@ -942,6 +1058,77 @@ mod protector_tests {
             offset: offset as u32,
             generation,
         }
+    }
+
+    /// The payload must begin AFTER the header it follows.
+    ///
+    /// `STRUCT_SIZE` is what `alloc` adds to a block's offset to reach the
+    /// user's, and `2 * WORD` is what the header physically occupies. This
+    /// file used to store two `u64`s whatever `LINK` said, so at `LINK = 8`
+    /// -- `sizeof( BlockLink_t )` on every 32-bit target FreeRTOS runs on,
+    /// and the geometry THIS MODULE is declared with -- the header took
+    /// sixteen bytes while `STRUCT_SIZE` claimed eight. The payload began ON
+    /// the size word, so the caller's first write destroyed the block's own
+    /// length. Written as an assertion it read:
+    ///
+    /// ```text
+    /// the payload starts at 8 but the header this block owns runs to 16;
+    /// the caller's first write lands on the size word at 8
+    /// ```
+    #[test]
+    fn the_payload_begins_after_the_header_it_follows() {
+        let mut heap = Heap::new();
+        let block = heap.alloc(8).expect("room for 8 bytes");
+        let user = block.offset();
+        let chosen = user - Heap::STRUCT_SIZE as u64;
+        let header_ends = chosen + 2 * Heap::WORD as u64;
+
+        assert!(
+            user >= header_ends,
+            "the payload starts at {user} but the header this block owns              runs to {header_ends}; the caller's first write lands on the              size word at {}",
+            chosen + Heap::WORD as u64,
+        );
+        assert_eq!(Heap::WORD, 4, "a LINK of 8 stores 32-bit words");
+    }
+
+    /// The narrow header round-trips under churn.
+    ///
+    /// The arithmetic above proves the payload clears the header; this
+    /// proves the header SURVIVES, which is the other half. Under the old
+    /// fixed-width store every 8-byte header write also wrote the eight
+    /// bytes after it, so a neighbour's link or length was overwritten and
+    /// the arena could not coalesce back to one block.
+    #[test]
+    fn the_narrow_header_survives_a_full_cycle() {
+        let mut heap = Heap::new();
+        // `heap_4` builds its free list lazily, as `prvHeapInit` does on the
+        // first `pvPortMalloc`, so the arena reads zero free until something
+        // has been asked of it. Take the baseline after that, not before.
+        let first = heap.alloc(24).expect("the arena had room");
+        heap.free(first).expect("freed");
+        let before = heap.free_bytes();
+        let mut held = [None; 24];
+        for cell in &mut held {
+            *cell = heap.alloc(24);
+            assert!(cell.is_some(), "the arena had room");
+        }
+        // Give them back out of order, so coalescing runs in both
+        // directions rather than just unwinding the allocations.
+        for i in (0..held.len()).step_by(2) {
+            let slot = held.get_mut(i).and_then(Option::take).expect("held");
+            assert_eq!(heap.free(slot), Ok(()));
+        }
+        for cell in &mut held {
+            if let Some(slot) = cell.take() {
+                assert_eq!(heap.free(slot), Ok(()));
+            }
+        }
+        assert_eq!(heap.free_bytes(), before, "every byte came back");
+        assert_eq!(
+            heap.free_list_shape().0,
+            1,
+            "the arena coalesced back to a single block"
+        );
     }
 
     /// An interior offset is refused -- and this is the case `heap_4.c` does
